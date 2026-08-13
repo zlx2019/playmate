@@ -93,11 +93,37 @@ pub fn run_emulation(
         // such as system sleep, to avoid an unbounded catch-up loop.
         let now = Instant::now();
         if next > now {
-            thread::sleep(next - now);
+            sleep_until(next);
         } else if now.duration_since(next) > Duration::from_millis(250) {
             next = now;
         }
         next += frame_dur;
     }
     log::info!("emulation thread exited");
+}
+
+/// Sleeps until `deadline` with sub-millisecond accuracy.
+///
+/// The Windows scheduler tick makes `thread::sleep` overshoot by up to ~15 ms,
+/// which turns the frame cadence into visible judder. Sleep short of the
+/// deadline there and spin the final stretch. macOS and Linux sleeps are
+/// already sub-millisecond accurate, so a plain sleep avoids burning CPU.
+#[cfg(target_os = "windows")]
+fn sleep_until(deadline: Instant) {
+    const SPIN_MARGIN: Duration = Duration::from_millis(3);
+    if let Some(remaining) = deadline.checked_duration_since(Instant::now())
+        && remaining > SPIN_MARGIN
+    {
+        thread::sleep(remaining - SPIN_MARGIN);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sleep_until(deadline: Instant) {
+    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        thread::sleep(remaining);
+    }
 }
