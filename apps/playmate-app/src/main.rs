@@ -8,6 +8,10 @@
 //! - Audio callback thread: cpal pulls samples from the ring buffer
 //! - tokio runtime: netplay tasks
 
+// Link Windows release builds with the GUI subsystem so launching the app
+// does not spawn an extra console window; debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod config;
