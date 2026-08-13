@@ -577,6 +577,7 @@ impl ApplicationHandler for PlaymateApp {
         }
         let attrs = Window::default_attributes()
             .with_title("Playmate")
+            .with_window_icon(load_window_icon())
             .with_inner_size(LogicalSize::new(900.0, 700.0))
             .with_min_inner_size(LogicalSize::new(640.0, 520.0));
         let window = match event_loop.create_window(attrs) {
@@ -721,21 +722,36 @@ fn lobby_with_error(reason: String) -> LobbyState {
     state
 }
 
+/// Decodes the embedded raw RGBA window icon for the title bar and taskbar.
+///
+/// Windows and X11 use it at runtime; macOS ignores window icons and shows the
+/// bundle .icns instead. The blob is exported by `scripts/gen-icons.sh`.
+fn load_window_icon() -> Option<winit::window::Icon> {
+    const RGBA: &[u8] = include_bytes!("../../../assets/icon/window-48.rgba");
+    winit::window::Icon::from_rgba(RGBA.to_vec(), 48, 48)
+        .inspect_err(|e| log::warn!("failed to load window icon: {e}"))
+        .ok()
+}
+
 /// Installs a system CJK font because egui's default fonts do not cover Chinese.
 /// Tries common platform paths and falls back with a warning when none are available.
 fn install_cjk_fonts(ctx: &egui::Context) {
-    let candidates = [
+    let mut candidates: Vec<std::path::PathBuf> = vec![
         // macOS
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        // Windows
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyh.ttf",
-        // Common Noto CJK paths on Linux distributions.
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc".into(),
+        "/System/Library/Fonts/Hiragino Sans GB.ttc".into(),
     ];
-    for path in candidates {
+    // Windows fonts live under %WINDIR%\Fonts, which is not always on drive C.
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        let fonts_dir = std::path::Path::new(&windir).join("Fonts");
+        for name in ["msyh.ttc", "msyh.ttf", "simhei.ttf"] {
+            candidates.push(fonts_dir.join(name));
+        }
+    }
+    // Common Noto CJK paths on Linux distributions.
+    candidates.push("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into());
+    candidates.push("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into());
+    for path in &candidates {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -752,7 +768,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             list.push("cjk".to_owned());
         }
         ctx.set_fonts(fonts);
-        log::info!("loaded CJK font: {path}");
+        log::info!("loaded CJK font: {}", path.display());
         return;
     }
     log::warn!("no system CJK font found; Chinese UI text may not render correctly");

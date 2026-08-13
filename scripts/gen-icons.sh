@@ -58,4 +58,8 @@ magick "$TMP/ico_256.png" "$TMP/ico_128.png" "$TMP/ico_64.png" "$TMP/ico_48.png"
 # --- Linux PNG for the .desktop entry ---
 magick "$TMP/composed.png" -resize 256x256 "$OUT/playmate-256.png"
 
+# --- winit runtime window icon: raw 48x48 RGBA embedded via include_bytes,
+# which avoids pulling a PNG decoder into the app ---
+magick "$TMP/composed.png" -resize '48x48!' -depth 8 "rgba:$OUT/window-48.rgba"
+
 echo "icons generated in $OUT/"
