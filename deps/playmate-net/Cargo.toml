@@ -1,0 +1,19 @@
+[package]
+name = "playmate-net"
+description = "Playmate networking: LAN discovery, pairing handshake, and session protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+mdns-sd.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

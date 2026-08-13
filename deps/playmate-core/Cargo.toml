@@ -1,0 +1,17 @@
+[package]
+name = "playmate-core"
+description = "NES emulation core abstraction: NesCore trait and tetanes-core wrapper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tetanes-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

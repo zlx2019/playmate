@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  # git-cliff 的 GitHub 集成需要读 PR 元数据（声明 permissions 后未列出的 scope 默认为 none）
+  pull-requests: read
+
+jobs:
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches workspace version
+        run: |
+          ver=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "playmate-app") | .version')
+          tag="${{ github.ref_name }}"
+          if [ "v$ver" != "${tag%%-*}" ] && [ "v$ver" != "$tag" ]; then
+            echo "::error::tag $tag 与 workspace 版本 $ver 不一致"
+            exit 1
+          fi
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: ${{ contains(github.ref_name, '-') && format('--unreleased --tag {0}', github.ref_name) || '--latest' }} --strip header
+        env:
+          OUTPUT: CHANGES.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: CHANGES.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: changelog
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            include_extra: ",assets/linux/playmate.desktop,assets/icon/playmate-256.png"
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }} --bin Playmate
+      - name: Bundle .app / .dmg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          scripts/make-app.sh "target/${{ matrix.target }}/release/Playmate" target/bundle
+          mv target/bundle/Playmate-*.dmg "Playmate-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+          shasum -a 256 "Playmate-${{ github.ref_name }}-${{ matrix.target }}.dmg" \
+            > "Playmate-${{ github.ref_name }}-${{ matrix.target }}.dmg.sha256"
+      - name: Upload dmg (macOS)
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "Playmate-${{ github.ref_name }}-${{ matrix.target }}.dmg" \
+            "Playmate-${{ github.ref_name }}-${{ matrix.target }}.dmg.sha256" --clobber
+
+      - name: Build and upload (Windows / Linux)
+        if: runner.os != 'macOS'
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: Playmate
+          target: ${{ matrix.target }}
+          archive: Playmate-$tag-$target
+          include: README.md,README.zh-CN.md,LICENSE,playmate.example.toml,roms${{ matrix.include_extra }}
+          leading-dir: true
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Playmate
+Comment=LAN co-op FC/NES emulator
+Comment[zh_CN]=局域网双人 FC 模拟器
+Exec=Playmate
+Icon=playmate
+Terminal=false
+Categories=Game;Emulator;

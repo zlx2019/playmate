@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["apps/*", "deps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+authors = ["Zero <1143967454@qq.com>"]
+homepage = "https://github.com/zlx2019/playmate"
+repository = "https://github.com/zlx2019/playmate"
+license = "MIT"
+
+[workspace.dependencies]
+playmate-core = { path = "deps/playmate-core" }
+playmate-net = { path = "deps/playmate-net" }
+
+tetanes-core = "0.15"
+
+egui = "0.36"
+egui-winit = "0.36"
+egui-wgpu = { version = "0.36", features = ["winit"] }
+winit = { version = "0.30", features = ["serde"] }
+cpal = "0.18"
+gilrs = "0.11"
+
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+tokio = { version = "1", features = ["full"] }
+mdns-sd = "0.21"
+lz4_flex = "0.14"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

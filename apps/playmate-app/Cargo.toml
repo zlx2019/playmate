@@ -1,0 +1,35 @@
+[package]
+name = "playmate-app"
+description = "Playmate desktop app: window rendering, audio output, and input handling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "Playmate"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+playmate-core.workspace = true
+playmate-net.workspace = true
+tokio.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+egui-wgpu.workspace = true
+winit.workspace = true
+cpal.workspace = true
+gilrs.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

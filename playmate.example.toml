@@ -1,0 +1,40 @@
+# Playmate 配置文件示例
+#
+# 使用方法：复制本文件为运行目录下的 playmate.toml 并按需修改。
+# 没有 playmate.toml 时程序使用与本文件相同的内置默认值。
+#
+# 键名使用 winit KeyCode 变体名（区分大小写），常用值：
+#   字母键:   "KeyA" ~ "KeyZ"
+#   方向键:   "ArrowUp" / "ArrowDown" / "ArrowLeft" / "ArrowRight"
+#   小键盘:   "Numpad0" ~ "Numpad9" / "NumpadDecimal" / "NumpadEnter"
+#   修饰键:   "ShiftLeft" / "ShiftRight" / "ControlLeft" / "AltLeft"
+#   其他:     "Enter" / "Space" / "Tab" / "Backspace"
+# 完整列表: https://docs.rs/winit/0.30/winit/keyboard/enum.KeyCode.html
+#
+# 注意：
+# - Escape 是保留键（退出程序），请勿绑定。
+# - 某玩家的段（[keys.p1] / [keys.p2]）一旦写出，该玩家 8 个键
+#   完全以段内内容为准，段内省略的键视为"不绑定"。
+# - 手柄即插即用无需配置：按先后顺序分配给 P1、P2；
+#   十字键/左摇杆=方向，南键(A)=B、东键(B)=A，Back=Select，Menu=Start。
+
+[keys.p1]
+up = "KeyW"
+down = "KeyS"
+left = "KeyA"
+right = "KeyD"
+b = "KeyJ"
+a = "KeyK"
+select = "ShiftLeft"
+start = "Enter"
+
+[keys.p2]
+up = "ArrowUp"
+down = "ArrowDown"
+left = "ArrowLeft"
+right = "ArrowRight"
+b = "Numpad0"
+a = "NumpadDecimal"
+start = "NumpadEnter"
+# P2 默认不绑定 select（真机 2P 手柄没有 Select 键），需要时取消注释：
+# select = "NumpadSubtract"
