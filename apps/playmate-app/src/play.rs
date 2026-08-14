@@ -201,6 +201,8 @@ pub struct GuestPlay {
     keyboard: ButtonState,
     /// Last merged bitmap sent, used to avoid sending unchanged input every frame.
     last_sent: u8,
+    /// Spectators watch the stream and never produce input.
+    spectator: bool,
 }
 
 impl GuestPlay {
@@ -211,6 +213,7 @@ impl GuestPlay {
         framebuffer: Arc<Mutex<Vec<u8>>>,
         ring: Arc<AudioRing>,
         sample_rate: u32,
+        spectator: bool,
     ) -> anyhow::Result<Self> {
         let (audio_stream, actual_rate) = audio::start(ring, Some(sample_rate))?;
         if actual_rate != sample_rate {
@@ -218,7 +221,11 @@ impl GuestPlay {
                 "audio sample-rate negotiation: requested {sample_rate}, got {actual_rate}; pitch may differ"
             );
         }
-        log::info!("netplay started: {rom_title} (local slot: {my_slot:?})");
+        if spectator {
+            log::info!("netplay spectating started: {rom_title}");
+        } else {
+            log::info!("netplay started: {rom_title} (local slot: {my_slot:?})");
+        }
         Ok(Self {
             rom_title,
             framebuffer,
@@ -226,12 +233,21 @@ impl GuestPlay {
             texture: None,
             keyboard: ButtonState::empty(),
             last_sent: 0,
+            spectator,
         })
+    }
+
+    /// Whether this session is watch-only.
+    pub fn is_spectator(&self) -> bool {
+        self.spectator
     }
 
     /// Handles a keyboard event and returns whether it was consumed.
     /// In netplay, both configured keyboard layouts control the local player.
     pub fn on_key(&mut self, input_map: &InputMap, code: KeyCode, pressed: bool) -> bool {
+        if self.spectator {
+            return false;
+        }
         let Some((_player, button)) = input_map.lookup(code) else {
             return false;
         };
@@ -240,7 +256,11 @@ impl GuestPlay {
     }
 
     /// Merges keyboard and gamepad input, returning changes for the network task.
+    /// Spectators never produce outgoing input.
     pub fn poll_outgoing(&mut self, gamepad: &GamepadInput) -> Option<u8> {
+        if self.spectator {
+            return None;
+        }
         let merged = self.keyboard.bits() | gamepad.state(Player::One).bits();
         if merged != self.last_sent {
             self.last_sent = merged;

@@ -18,7 +18,36 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Protocol version, validated during the handshake.
 /// v2: `SwapSlots` replaced by the consent-based `SwapRequest`/`SwapResponse` pair.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3: `Hello` carries a join role; `Roster` broadcasts room membership.
+pub const PROTOCOL_VERSION: u16 = 3;
+
+/// Role a client requests when joining a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinRole {
+    /// Occupies the second player seat and sends input.
+    Player,
+    /// Receives the media stream only; never sends input.
+    Spectator,
+}
+
+impl JoinRole {
+    /// Wire encoding of the role.
+    fn to_wire(self) -> u8 {
+        match self {
+            JoinRole::Player => 0,
+            JoinRole::Spectator => 1,
+        }
+    }
+
+    /// Decodes the wire value, rejecting unknown roles.
+    fn from_wire(value: u8) -> io::Result<Self> {
+        match value {
+            0 => Ok(JoinRole::Player),
+            1 => Ok(JoinRole::Spectator),
+            other => Err(invalid(format!("未知的加入角色: {other}"))),
+        }
+    }
+}
 
 /// Maximum message size: 16 MiB, well above an uncompressed frame.
 /// This prevents a corrupted length field from exhausting memory.
@@ -27,12 +56,14 @@ const MAX_MESSAGE_LEN: u32 = 16 * 1024 * 1024;
 /// Session message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// Client greeting with protocol version and display name.
+    /// Client greeting with protocol version, display name, and desired role.
     Hello {
         /// Client protocol version.
         version: u16,
         /// Client display name, such as a host name.
         name: String,
+        /// Seat the client wants to occupy.
+        role: JoinRole,
     },
     /// Host response requesting the pairing code.
     Challenge,
@@ -96,6 +127,31 @@ pub enum Message {
     },
     /// Game ended (host -> client); both sides return to the room and may choose another game.
     GameEnd,
+    /// Room membership broadcast (host -> all) sent whenever it changes.
+    Roster {
+        /// Display name of the guest player seat, when occupied.
+        player: Option<String>,
+        /// Display names of connected spectators.
+        spectators: Vec<String>,
+    },
+    /// A spectator asks to take the player seat (spectator -> host), and the
+    /// host forwards it to the seated player for approval (host -> player).
+    SeatChangeRequest {
+        /// Requesting spectator's display name; empty when sent to the host,
+        /// which already knows the sender.
+        spectator: String,
+    },
+    /// Answer to `SeatChangeRequest` (player -> host), relayed to the
+    /// requester on decline (host -> spectator).
+    SeatChangeResponse {
+        /// Whether the seat change was approved.
+        accepted: bool,
+    },
+    /// The receiver's own role changed after an approved seat change (host -> client).
+    RoleChanged {
+        /// The receiver's new role.
+        role: JoinRole,
+    },
 }
 
 /// Tag values for each message type.
@@ -115,6 +171,10 @@ mod tag {
     pub const INPUT: u8 = 13;
     pub const GAME_END: u8 = 14;
     pub const SWAP_RESPONSE: u8 = 15;
+    pub const ROSTER: u8 = 16;
+    pub const SEAT_CHANGE_REQUEST: u8 = 17;
+    pub const SEAT_CHANGE_RESPONSE: u8 = 18;
+    pub const ROLE_CHANGED: u8 = 19;
 }
 
 impl Message {
@@ -145,8 +205,13 @@ impl Message {
     fn encode(&self) -> io::Result<(u8, Vec<u8>)> {
         let mut payload = Vec::new();
         let tag_byte = match self {
-            Message::Hello { version, name } => {
+            Message::Hello {
+                version,
+                name,
+                role,
+            } => {
                 payload.extend_from_slice(&version.to_le_bytes());
+                payload.push(role.to_wire());
                 write_str(&mut payload, name)?;
                 tag::HELLO
             }
@@ -201,6 +266,34 @@ impl Message {
                 tag::INPUT
             }
             Message::GameEnd => tag::GAME_END,
+            Message::SeatChangeRequest { spectator } => {
+                write_str(&mut payload, spectator)?;
+                tag::SEAT_CHANGE_REQUEST
+            }
+            Message::SeatChangeResponse { accepted } => {
+                payload.push(u8::from(*accepted));
+                tag::SEAT_CHANGE_RESPONSE
+            }
+            Message::RoleChanged { role } => {
+                payload.push(role.to_wire());
+                tag::ROLE_CHANGED
+            }
+            Message::Roster { player, spectators } => {
+                match player {
+                    Some(name) => {
+                        payload.push(1);
+                        write_str(&mut payload, name)?;
+                    }
+                    None => payload.push(0),
+                }
+                let count =
+                    u8::try_from(spectators.len()).map_err(|_| invalid("观众数量超出编码上限"))?;
+                payload.push(count);
+                for name in spectators {
+                    write_str(&mut payload, name)?;
+                }
+                tag::ROSTER
+            }
         };
         Ok((tag_byte, payload))
     }
@@ -212,8 +305,13 @@ impl Message {
             tag::HELLO => {
                 let version_bytes = take(&mut rest, 2)?;
                 let version = u16::from_le_bytes([version_bytes[0], version_bytes[1]]);
+                let role = JoinRole::from_wire(take(&mut rest, 1)?[0])?;
                 let name = read_str(&mut rest)?;
-                Message::Hello { version, name }
+                Message::Hello {
+                    version,
+                    name,
+                    role,
+                }
             }
             tag::CHALLENGE => Message::Challenge,
             tag::PAIR_CODE => Message::PairCode {
@@ -269,6 +367,30 @@ impl Message {
                 Message::Input { buttons: b[0] }
             }
             tag::GAME_END => Message::GameEnd,
+            tag::SEAT_CHANGE_REQUEST => Message::SeatChangeRequest {
+                spectator: read_str(&mut rest)?,
+            },
+            tag::SEAT_CHANGE_RESPONSE => {
+                let flag = take(&mut rest, 1)?;
+                Message::SeatChangeResponse {
+                    accepted: flag[0] != 0,
+                }
+            }
+            tag::ROLE_CHANGED => Message::RoleChanged {
+                role: JoinRole::from_wire(take(&mut rest, 1)?[0])?,
+            },
+            tag::ROSTER => {
+                let player = match take(&mut rest, 1)?[0] {
+                    0 => None,
+                    _ => Some(read_str(&mut rest)?),
+                };
+                let count = usize::from(take(&mut rest, 1)?[0]);
+                let mut spectators = Vec::with_capacity(count);
+                for _ in 0..count {
+                    spectators.push(read_str(&mut rest)?);
+                }
+                Message::Roster { player, spectators }
+            }
             other => return Err(invalid(format!("未知消息 tag: {other}"))),
         };
         Ok(msg)
@@ -319,6 +441,12 @@ mod tests {
             Message::Hello {
                 version: PROTOCOL_VERSION,
                 name: "Zero's MacBook".to_string(),
+                role: JoinRole::Player,
+            },
+            Message::Hello {
+                version: PROTOCOL_VERSION,
+                name: "onlooker".to_string(),
+                role: JoinRole::Spectator,
             },
             Message::Challenge,
             Message::PairCode {
@@ -352,6 +480,22 @@ mod tests {
                 buttons: 0b1000_0001,
             },
             Message::GameEnd,
+            Message::Roster {
+                player: None,
+                spectators: Vec::new(),
+            },
+            Message::Roster {
+                player: Some("挑战者".to_string()),
+                spectators: vec!["观众A".to_string(), "观众B".to_string()],
+            },
+            Message::SeatChangeRequest {
+                spectator: "观众A".to_string(),
+            },
+            Message::SeatChangeResponse { accepted: true },
+            Message::SeatChangeResponse { accepted: false },
+            Message::RoleChanged {
+                role: JoinRole::Player,
+            },
         ];
         for original in cases {
             let mut wire = Vec::new();

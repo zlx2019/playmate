@@ -3,10 +3,10 @@
 //! Handshake flow:
 //!
 //! ```text
-//! Client ──── Hello{version, name} ───→ Host
-//! Client ←─── Challenge (or Reject) ──── Host   # Version validation
-//! Client ──── PairCode{code} ─────────→ Host
-//! Client ←─── Welcome{rom} (or Reject) ─ Host   # Pairing-code validation
+//! Client ──── Hello{version, name, role} ─→ Host
+//! Client ←─── Challenge (or Reject) ─────── Host   # Version validation
+//! Client ──── PairCode{code} ────────────→ Host
+//! Client ←─── Welcome{rom} (or Reject) ──── Host   # Code validation + seat claim
 //! ```
 //!
 //! Every handshake read has a timeout so a half-open connection cannot stall the task.
@@ -15,11 +15,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::NetError;
-use crate::protocol::{Message, PROTOCOL_VERSION};
+use crate::protocol::{JoinRole, Message, PROTOCOL_VERSION};
 
 /// Timeout for each handshake step, allowing enough time to enter a code.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +35,8 @@ pub struct HostSession {
     pub peer_name: String,
     /// Client address.
     pub peer_addr: SocketAddr,
+    /// Seat granted to the client.
+    pub role: JoinRole,
 }
 
 /// Client-side session after pairing completes.
@@ -56,43 +58,26 @@ async fn read_timed(stream: &mut TcpStream) -> Result<Message, NetError> {
     }
 }
 
-/// Waits until a client completes pairing with the host.
+/// Completes the host-side handshake with one client.
 ///
-/// Connections that fail because of a version mismatch, invalid code, or timeout
-/// are dropped before waiting for the next client. Only listener errors are returned.
-pub async fn host_wait_for_peer(
-    listener: &TcpListener,
-    pair_code: &str,
-    rom_name: &str,
-) -> Result<HostSession, NetError> {
-    loop {
-        let (mut stream, peer_addr) = listener.accept().await?;
-        log::info!("connection received: {peer_addr}");
-        match pair_with_client(&mut stream, pair_code, rom_name).await {
-            Ok(peer_name) => {
-                log::info!("pairing succeeded: {peer_name} ({peer_addr})");
-                return Ok(HostSession {
-                    stream,
-                    peer_name,
-                    peer_addr,
-                });
-            }
-            Err(e) => log::warn!("pairing failed ({peer_addr}): {e}; waiting for next connection"),
-        }
-    }
-}
-
-/// Completes the host-side handshake with one client and returns its display name.
-async fn pair_with_client(
+/// `seat_check` runs with the client's requested role after the pairing code
+/// validates; returning `Err(reason)` rejects the client. The caller claims a
+/// seat atomically inside the closure, before `Welcome` is sent.
+pub async fn pair_with_client(
     stream: &mut TcpStream,
     pair_code: &str,
     rom_name: &str,
-) -> Result<String, NetError> {
+    seat_check: impl FnOnce(JoinRole) -> Result<(), String>,
+) -> Result<(String, JoinRole), NetError> {
     stream.set_nodelay(true)?;
 
     // Step 1: validate the protocol version.
-    let (version, peer_name) = match read_timed(stream).await? {
-        Message::Hello { version, name } => (version, name),
+    let (version, peer_name, role) = match read_timed(stream).await? {
+        Message::Hello {
+            version,
+            name,
+            role,
+        } => (version, name, role),
         other => return Err(NetError::Protocol(format!("预期 Hello，收到 {other:?}"))),
     };
     if version != PROTOCOL_VERSION {
@@ -123,12 +108,22 @@ async fn pair_with_client(
         return Err(NetError::Rejected(reason));
     }
 
+    // Step 3: let the caller claim a seat for the requested role.
+    if let Err(reason) = seat_check(role) {
+        Message::Reject {
+            reason: reason.clone(),
+        }
+        .write_to(stream)
+        .await?;
+        return Err(NetError::Rejected(reason));
+    }
+
     Message::Welcome {
         rom_name: rom_name.to_string(),
     }
     .write_to(stream)
     .await?;
-    Ok(peer_name)
+    Ok((peer_name, role))
 }
 
 /// Rejects one incoming connection with `reason` after reading its `Hello`.
@@ -149,12 +144,13 @@ pub async fn reject_client(stream: &mut TcpStream, reason: &str) -> Result<(), N
     Ok(())
 }
 
-/// Connects to a host and completes client-side pairing.
+/// Connects to a host and completes client-side pairing for the given role.
 ///
 /// `code_provider` is called only after the host sends `Challenge`.
 pub async fn client_connect(
     addr: SocketAddr,
     client_name: &str,
+    role: JoinRole,
     code_provider: impl FnOnce() -> String,
 ) -> Result<ClientSession, NetError> {
     let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
@@ -171,6 +167,7 @@ pub async fn client_connect(
     Message::Hello {
         version: PROTOCOL_VERSION,
         name: client_name.to_string(),
+        role,
     }
     .write_to(&mut stream)
     .await?;
@@ -202,49 +199,74 @@ pub async fn client_connect(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use tokio::net::TcpListener;
+
     use super::*;
 
-    /// Test host that accepts only one connection, avoiding a retry loop on failure.
-    async fn host_wait_for_peer_once(listener: &TcpListener) -> Result<HostSession, NetError> {
+    /// Test host that accepts one connection and pairs it with the given seat policy.
+    async fn host_pair_once(
+        listener: &TcpListener,
+        seat_check: impl FnOnce(JoinRole) -> Result<(), String>,
+    ) -> Result<HostSession, NetError> {
         let (mut stream, peer_addr) = listener.accept().await?;
-        pair_with_client(&mut stream, "1234", "test-rom.nes")
+        pair_with_client(&mut stream, "1234", "test-rom.nes", seat_check)
             .await
-            .map(|peer_name| HostSession {
+            .map(|(peer_name, role)| HostSession {
                 stream,
                 peer_name,
                 peer_addr,
+                role,
             })
     }
 
     /// Runs a complete handshake with a real listener and concurrent host/client tasks.
     async fn run_handshake(
         client_code: &str,
+        role: JoinRole,
     ) -> (
         Result<HostSession, NetError>,
         Result<ClientSession, NetError>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let host = tokio::spawn(async move { host_wait_for_peer_once(&listener).await });
+        let host = tokio::spawn(async move { host_pair_once(&listener, |_| Ok(())).await });
         let code = client_code.to_string();
-        let client = client_connect(addr, "test-client", move || code).await;
+        let client = client_connect(addr, "test-client", role, move || code).await;
         (host.await.unwrap(), client)
     }
 
-    /// The correct code succeeds on both sides and returns the ROM name to the client.
+    /// The correct code succeeds on both sides, carrying role and ROM name across.
     #[tokio::test]
     async fn pairing_succeeds_with_correct_code() {
-        let (host, client) = run_handshake("1234").await;
+        let (host, client) = run_handshake("1234", JoinRole::Spectator).await;
         let host = host.unwrap();
         let client = client.unwrap();
         assert_eq!(host.peer_name, "test-client");
+        assert_eq!(host.role, JoinRole::Spectator);
         assert_eq!(client.rom_name, "test-rom.nes");
+    }
+
+    /// A failing seat check rejects the client with the given reason.
+    #[tokio::test]
+    async fn seat_check_rejection_reaches_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            host_pair_once(&listener, |_| Err("玩家位已满".to_string())).await
+        });
+        let client =
+            client_connect(addr, "test-client", JoinRole::Player, || "1234".to_string()).await;
+        assert!(matches!(host.await.unwrap(), Err(NetError::Rejected(_))));
+        let Err(err) = client else {
+            panic!("expected the seat check to reject the client");
+        };
+        assert!(matches!(err, NetError::Rejected(reason) if reason == "玩家位已满"));
     }
 
     /// An incorrect code is rejected by the host and reported to the client.
     #[tokio::test]
     async fn pairing_fails_with_wrong_code() {
-        let (host, client) = run_handshake("0000").await;
+        let (host, client) = run_handshake("0000", JoinRole::Player).await;
         assert!(matches!(host, Err(NetError::Rejected(_))));
         assert!(matches!(client, Err(NetError::Rejected(_))));
     }
@@ -258,7 +280,9 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             reject_client(&mut stream, "房间已满").await.unwrap();
         });
-        let Err(err) = client_connect(addr, "latecomer", || "1234".to_string()).await else {
+        let Err(err) =
+            client_connect(addr, "latecomer", JoinRole::Player, || "1234".to_string()).await
+        else {
             panic!("expected the full room to reject the newcomer");
         };
         assert!(matches!(err, NetError::Rejected(reason) if reason == "房间已满"));
