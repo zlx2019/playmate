@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-use playmate_net::{Room, browse_rooms};
+use playmate_net::{JoinRole, Room, browse_rooms};
 
 use crate::theme;
 
@@ -76,6 +76,8 @@ pub struct JoinDialog {
     pub room: Room,
     /// User-entered PIN.
     pub pin_input: String,
+    /// Whether to join as a spectator instead of a player.
+    pub as_spectator: bool,
 }
 
 impl LobbyState {
@@ -101,8 +103,8 @@ pub enum LobbyAction {
     Back,
     /// Create a room with its name and PIN.
     Create(String, String),
-    /// Join a target room with a PIN.
-    Join(Room, String),
+    /// Join a target room with a PIN and role.
+    Join(Room, String, JoinRole),
     /// Rejoin the previous room using address and PIN retained by the application.
     Rejoin,
 }
@@ -207,6 +209,7 @@ pub fn show(
                                 state.joining = Some(JoinDialog {
                                     room: room.clone(),
                                     pin_input: String::new(),
+                                    as_spectator: false,
                                 });
                             }
                         }
@@ -237,10 +240,21 @@ pub fn show(
                     .font(egui::FontId::proportional(24.0))
                     .hint_text("····"),
             );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("身份").color(theme::TEXT_WEAK));
+                ui.selectable_value(&mut dialog.as_spectator, false, "🎮 玩家");
+                ui.selectable_value(&mut dialog.as_spectator, true, "🖥 观战");
+            });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if theme::primary_button(ui, "加入", true).clicked() {
-                    action = LobbyAction::Join(dialog.room.clone(), dialog.pin_input.clone());
+                    let role = if dialog.as_spectator {
+                        JoinRole::Spectator
+                    } else {
+                        JoinRole::Player
+                    };
+                    action = LobbyAction::Join(dialog.room.clone(), dialog.pin_input.clone(), role);
                     close_dialog = true;
                 }
                 if ui.button("取消").clicked() {

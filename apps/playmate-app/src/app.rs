@@ -10,7 +10,7 @@ use std::sync::Arc;
 use egui_wgpu::winit::Painter;
 use egui_wgpu::{RendererOptions, WgpuConfiguration};
 use playmate_core::Player;
-use playmate_net::{Announcer, Room};
+use playmate_net::{Announcer, JoinRole, Room};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -95,6 +95,8 @@ enum Nav {
         room: Room,
         /// User-entered PIN.
         pin: String,
+        /// Seat to request from the host.
+        role: JoinRole,
     },
     /// Start a host game and transfer the room network handle.
     StartNetGame {
@@ -130,8 +132,8 @@ pub struct PlaymateApp {
     gamepad: GamepadInput,
     /// Current page.
     page: Page,
-    /// Most recently joined address and PIN for quick rejoin.
-    last_join: Option<(std::net::SocketAddr, String)>,
+    /// Most recently joined address, PIN, and role for quick rejoin.
+    last_join: Option<(std::net::SocketAddr, String, JoinRole)>,
     /// egui context, created before the window and configured with CJK fonts.
     egui_ctx: egui::Context,
     /// Main window, created after `resumed`.
@@ -256,6 +258,7 @@ impl PlaymateApp {
                         start.framebuffer,
                         start.ring,
                         start.sample_rate,
+                        net.is_spectator,
                     ) {
                         Ok(new_play) => *play = new_play,
                         Err(e) => net.error = Some(format!("恢复联机画面失败: {e:#}")),
@@ -273,8 +276,13 @@ impl PlaymateApp {
                                 ui.colored_label(egui::Color32::LIGHT_RED, err);
                             }
                             None => {
+                                let status = if play.is_spectator() {
+                                    "● 观战中"
+                                } else {
+                                    "● 联机中"
+                                };
                                 ui.label(
-                                    egui::RichText::new("● 联机中")
+                                    egui::RichText::new(status)
                                         .color(egui::Color32::from_rgb(110, 200, 110)),
                                 );
                             }
@@ -300,19 +308,20 @@ impl PlaymateApp {
                 }
             }
             Page::LanLobby { state } => {
-                let last_addr = self.last_join.as_ref().map(|(addr, _)| addr);
+                let last_addr = self.last_join.as_ref().map(|(addr, _, _)| addr);
                 match lobby::show(ui, state, last_addr) {
                     LobbyAction::None => {}
                     LobbyAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                     LobbyAction::Create(name, pin) => nav = Nav::CreateRoom { name, pin },
-                    LobbyAction::Join(room_info, pin) => {
+                    LobbyAction::Join(room_info, pin, role) => {
                         nav = Nav::JoinRoom {
                             room: room_info,
                             pin,
+                            role,
                         };
                     }
                     LobbyAction::Rejoin => {
-                        if let Some((addr, pin)) = self.last_join.clone() {
+                        if let Some((addr, pin, role)) = self.last_join.clone() {
                             nav = Nav::JoinRoom {
                                 room: Room {
                                     name: String::new(),
@@ -320,6 +329,7 @@ impl PlaymateApp {
                                     addr,
                                 },
                                 pin,
+                                role,
                             };
                         }
                     }
@@ -328,6 +338,16 @@ impl PlaymateApp {
             Page::Room { state } => {
                 // Client: create gameplay when the host starts a game.
                 let updates = room::apply_events(state);
+                // An approved seat change updates the quick-rejoin role.
+                if let Some(is_spectator) = updates.role_changed
+                    && let Some((_, _, role)) = self.last_join.as_mut()
+                {
+                    *role = if is_spectator {
+                        JoinRole::Spectator
+                    } else {
+                        JoinRole::Player
+                    };
+                }
                 // Terminal failures return to the lobby and clear the now-invalid quick-rejoin entry.
                 if let Some(reason) = updates.fatal {
                     self.last_join = None;
@@ -341,6 +361,7 @@ impl PlaymateApp {
                         start.framebuffer,
                         start.ring,
                         start.sample_rate,
+                        state.is_spectator,
                     ) {
                         Ok(play) => nav = Nav::StartGuestGame { play },
                         Err(e) => state.error = Some(format!("建立联机画面失败: {e:#}")),
@@ -408,11 +429,11 @@ impl PlaymateApp {
                     }
                 }
             },
-            Nav::JoinRoom { room, pin } => {
+            Nav::JoinRoom { room, pin, role } => {
                 let my_name = std::env::var("USER").unwrap_or_else(|_| "玩家".to_string());
                 // Retain join details for the lobby's quick-rejoin action.
-                self.last_join = Some((room.addr, pin.clone()));
-                let handle = netplay::spawn_guest(&self.rt, room.addr, pin, my_name);
+                self.last_join = Some((room.addr, pin.clone(), role));
+                let handle = netplay::spawn_guest(&self.rt, room.addr, pin, my_name, role);
                 self.page = Page::Room {
                     state: RoomState {
                         handle,
@@ -427,6 +448,11 @@ impl PlaymateApp {
                         error: None,
                         swap_outgoing: false,
                         swap_incoming: None,
+                        is_spectator: role == JoinRole::Spectator,
+                        seat_outgoing: false,
+                        seat_incoming: None,
+                        roster_player: None,
+                        spectators: Vec::new(),
                         _announcer: None,
                     },
                 };
@@ -511,6 +537,11 @@ impl PlaymateApp {
                 error: None,
                 swap_outgoing: false,
                 swap_incoming: None,
+                is_spectator: false,
+                seat_outgoing: false,
+                seat_incoming: None,
+                roster_player: None,
+                spectators: Vec::new(),
                 _announcer: Some(announcer),
             },
         })
