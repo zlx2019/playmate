@@ -135,14 +135,17 @@ pub fn start(ring: Arc<AudioRing>, desired_rate: Option<u32>) -> Result<(cpal::S
     let device_rate = default_config.sample_rate;
 
     // Try the requested rate first so a matching device plays without conversion.
+    // Depending on the backend, an unsupported rate can fail at build or at
+    // play; either failure falls back to the device default rate below.
     if let Some(rate) = desired_rate
         && rate != device_rate
     {
         let mut config = default_config;
         config.sample_rate = rate;
-        match build_stream(&device, config, channels, Arc::clone(&ring), None) {
+        match build_stream(&device, config, channels, Arc::clone(&ring), None)
+            .and_then(|stream| stream.play().map(|_| stream))
+        {
             Ok(stream) => {
-                stream.play().context("启动音频输出流失败")?;
                 log::info!("audio output ready: {rate} Hz, {channels} channels");
                 return Ok((stream, rate));
             }
