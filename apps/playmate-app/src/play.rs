@@ -215,12 +215,9 @@ impl GuestPlay {
         sample_rate: u32,
         spectator: bool,
     ) -> anyhow::Result<Self> {
-        let (audio_stream, actual_rate) = audio::start(ring, Some(sample_rate))?;
-        if actual_rate != sample_rate {
-            log::warn!(
-                "audio sample-rate negotiation: requested {sample_rate}, got {actual_rate}; pitch may differ"
-            );
-        }
+        // `audio::start` resamples internally if the device rejects the host
+        // rate, so the ring is always consumed at `sample_rate`.
+        let (audio_stream, _) = audio::start(ring, Some(sample_rate))?;
         if spectator {
             log::info!("netplay spectating started: {rom_title}");
         } else {
