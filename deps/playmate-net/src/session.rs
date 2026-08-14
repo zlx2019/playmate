@@ -131,6 +131,24 @@ async fn pair_with_client(
     Ok(peer_name)
 }
 
+/// Rejects one incoming connection with `reason` after reading its `Hello`.
+///
+/// Used by a host whose room is already occupied: the newcomer gets an
+/// immediate answer instead of timing out in the accept backlog.
+pub async fn reject_client(stream: &mut TcpStream, reason: &str) -> Result<(), NetError> {
+    stream.set_nodelay(true)?;
+    match read_timed(stream).await? {
+        Message::Hello { .. } => {}
+        other => return Err(NetError::Protocol(format!("预期 Hello，收到 {other:?}"))),
+    }
+    Message::Reject {
+        reason: reason.to_owned(),
+    }
+    .write_to(stream)
+    .await?;
+    Ok(())
+}
+
 /// Connects to a host and completes client-side pairing.
 ///
 /// `code_provider` is called only after the host sends `Challenge`.
@@ -229,5 +247,21 @@ mod tests {
         let (host, client) = run_handshake("0000").await;
         assert!(matches!(host, Err(NetError::Rejected(_))));
         assert!(matches!(client, Err(NetError::Rejected(_))));
+    }
+
+    /// A full room rejects the newcomer right after its `Hello`, with the reason intact.
+    #[tokio::test]
+    async fn full_room_rejects_newcomer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            reject_client(&mut stream, "房间已满").await.unwrap();
+        });
+        let Err(err) = client_connect(addr, "latecomer", || "1234".to_string()).await else {
+            panic!("expected the full room to reject the newcomer");
+        };
+        assert!(matches!(err, NetError::Rejected(reason) if reason == "房间已满"));
+        host.await.unwrap();
     }
 }

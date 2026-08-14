@@ -425,6 +425,8 @@ impl PlaymateApp {
                         games: Vec::new(),
                         selected: None,
                         error: None,
+                        swap_outgoing: false,
+                        swap_incoming: None,
                         _announcer: None,
                     },
                 };
@@ -507,6 +509,8 @@ impl PlaymateApp {
                 games: game_select::scan_roms(),
                 selected: None,
                 error: None,
+                swap_outgoing: false,
+                swap_incoming: None,
                 _announcer: Some(announcer),
             },
         })

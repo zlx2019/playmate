@@ -19,7 +19,7 @@ pub mod session;
 pub use codec::{FrameDecoder, FrameEncoder, f32_to_i16_bytes, i16_bytes_to_f32};
 pub use discovery::{Announcer, Room, browse_rooms};
 pub use protocol::{Message, PROTOCOL_VERSION};
-pub use session::{ClientSession, HostSession, client_connect, host_wait_for_peer};
+pub use session::{ClientSession, HostSession, client_connect, host_wait_for_peer, reject_client};
 
 /// Common error type for the networking layer.
 #[derive(Debug, thiserror::Error)]
