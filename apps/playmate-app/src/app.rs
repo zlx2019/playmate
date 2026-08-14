@@ -22,6 +22,7 @@ use crate::config::{self, Config, InputMap};
 use crate::emu::NetSink;
 use crate::gamepad::GamepadInput;
 use crate::netplay::{self, RoomCmd};
+use crate::pages::game_menu::{self, GameMenu, GameMenuAction};
 use crate::pages::game_select::{self, GameEntry, GameSelectAction};
 use crate::pages::lobby::{self, LobbyAction, LobbyState};
 use crate::pages::main_menu::{self, MenuAction};
@@ -51,6 +52,8 @@ pub enum Page {
         /// Netplay context for a host game; `None` for local play.
         /// Dropping it disconnects the session and unregisters mDNS.
         net: Option<RoomState>,
+        /// Pause/menu overlay state.
+        menu: GameMenu,
     },
     /// LAN lobby.
     LanLobby {
@@ -68,6 +71,8 @@ pub enum Page {
         play: GuestPlay,
         /// Room network state; dropping the handle leaves the room.
         net: RoomState,
+        /// Pause/menu overlay state.
+        menu: GameMenu,
     },
     /// Key-binding settings.
     Settings {
@@ -198,13 +203,17 @@ impl PlaymateApp {
                     GameSelectAction::Refresh => *games = game_select::scan_roms(),
                     GameSelectAction::Play(path) => match PlaySession::start(&path) {
                         Ok(session) => {
-                            nav = Nav::To(Box::new(Page::Playing { session, net: None }));
+                            nav = Nav::To(Box::new(Page::Playing {
+                                session,
+                                net: None,
+                                menu: GameMenu::default(),
+                            }));
                         }
                         Err(e) => *error = Some(format!("启动失败: {e:#}")),
                     },
                 }
             }
-            Page::Playing { session, net } => {
+            Page::Playing { session, net, menu } => {
                 // Host: consume room events, including peer-disconnect status.
                 if let Some(net_state) = net {
                     let updates = room::apply_events(net_state);
@@ -213,16 +222,11 @@ impl PlaymateApp {
                         net_state.error = Some(reason);
                     }
                 }
-                let mut back = false;
-                let back_label = if net.is_some() {
-                    "← 返回房间 (Esc)"
-                } else {
-                    "← 返回菜单 (Esc)"
-                };
+                let mut open_menu = false;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.button(back_label).clicked() {
-                            back = true;
+                        if ui.button("菜单 (Esc)").clicked() {
+                            open_menu = true;
                         }
                         ui.label(egui::RichText::new(&session.rom_title).strong());
                         if let Some(net_state) = net {
@@ -242,12 +246,32 @@ impl PlaymateApp {
                     ui.separator();
                     session.ui(ui);
                 });
-                if back {
-                    // Netplay returns to the room for another game; local play returns to the menu.
-                    nav = Nav::BackToRoom;
+                if open_menu && !menu.open {
+                    menu.open = true;
+                    session.clear_input();
+                    // Only local play truly pauses; a host game keeps running for peers.
+                    session.set_paused(net.is_none());
+                }
+                if menu.open {
+                    match game_menu::show(ui, &self.cfg, menu, net.is_none()) {
+                        GameMenuAction::None => {}
+                        GameMenuAction::Resume => {
+                            menu.open = false;
+                            menu.settings = None;
+                            session.set_paused(false);
+                        }
+                        // Netplay returns to the room for another game; local
+                        // play drops the session and returns to the menu.
+                        GameMenuAction::Exit => nav = Nav::BackToRoom,
+                        GameMenuAction::RestoreDefaults => restore_default_keys(
+                            &mut self.cfg,
+                            &mut self.input_map,
+                            menu.settings.as_mut(),
+                        ),
+                    }
                 }
             }
-            Page::GuestPlaying { play, net } => {
+            Page::GuestPlaying { play, net, menu } => {
                 let updates = room::apply_events(net);
                 let had_start = updates.start.is_some();
                 // Rebuild gameplay with new shared buffers after reconnecting to an active game.
@@ -265,10 +289,11 @@ impl PlaymateApp {
                     }
                 }
                 let mut leave = false;
+                let mut open_menu = false;
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.button("← 离开房间 (Esc)").clicked() {
-                            leave = true;
+                        if ui.button("菜单 (Esc)").clicked() {
+                            open_menu = true;
                         }
                         ui.label(egui::RichText::new(&play.rom_title).strong());
                         match &net.error {
@@ -291,6 +316,26 @@ impl PlaymateApp {
                     ui.separator();
                     play.ui(ui);
                 });
+                if open_menu && !menu.open {
+                    menu.open = true;
+                    play.clear_input();
+                }
+                if menu.open {
+                    // Clients cannot pause the host's game; the menu only overlays it.
+                    match game_menu::show(ui, &self.cfg, menu, false) {
+                        GameMenuAction::None => {}
+                        GameMenuAction::Resume => {
+                            menu.open = false;
+                            menu.settings = None;
+                        }
+                        GameMenuAction::Exit => leave = true,
+                        GameMenuAction::RestoreDefaults => restore_default_keys(
+                            &mut self.cfg,
+                            &mut self.input_map,
+                            menu.settings.as_mut(),
+                        ),
+                    }
+                }
                 if let Some(reason) = updates.fatal {
                     // A terminal session failure returns to the lobby and clears stale quick rejoin.
                     self.last_join = None;
@@ -404,12 +449,7 @@ impl PlaymateApp {
                 SettingsAction::None => {}
                 SettingsAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                 SettingsAction::RestoreDefaults => {
-                    self.cfg.keys = Default::default();
-                    self.input_map = InputMap::from_config(&self.cfg);
-                    state.hint = Some(match config::save(&mut self.cfg) {
-                        Ok(()) => "已恢复默认键位".to_string(),
-                        Err(e) => format!("保存失败: {e:#}"),
-                    });
+                    restore_default_keys(&mut self.cfg, &mut self.input_map, Some(state));
                 }
             },
         }
@@ -478,13 +518,18 @@ impl PlaymateApp {
                     self.page = Page::Playing {
                         session,
                         net: Some(state),
+                        menu: GameMenu::default(),
                     };
                 }
             }
             Nav::StartGuestGame { play } => {
                 let old = std::mem::replace(&mut self.page, Page::MainMenu);
                 if let Page::Room { state } = old {
-                    self.page = Page::GuestPlaying { play, net: state };
+                    self.page = Page::GuestPlaying {
+                        play,
+                        net: state,
+                        menu: GameMenu::default(),
+                    };
                 }
             }
             Nav::BackToRoom => {
@@ -547,29 +592,65 @@ impl PlaymateApp {
         })
     }
 
+    /// Returns the settings state currently accepting input, either the
+    /// settings page or the settings view embedded in the in-game menu.
+    fn settings_state_mut(&mut self) -> Option<&mut SettingsState> {
+        match &mut self.page {
+            Page::Settings { state } => Some(state),
+            Page::Playing { menu, .. } | Page::GuestPlaying { menu, .. } => menu.settings.as_mut(),
+            _ => None,
+        }
+    }
+
     /// Captures a physical key for the pending setting and saves it immediately.
     /// Returns whether the keyboard event was consumed.
     fn handle_rebind_capture(&mut self, code: KeyCode) -> bool {
-        let Page::Settings { state } = &mut self.page else {
-            return false;
-        };
-        let Some((player, button)) = state.capturing.take() else {
+        let Some((player, button)) = self.settings_state_mut().and_then(|s| s.capturing.take())
+        else {
             return false;
         };
         if code == KeyCode::Escape {
-            state.hint = Some("已取消".to_string());
+            if let Some(state) = self.settings_state_mut() {
+                state.hint = Some("已取消".to_string());
+            }
             return true;
         }
         config::bind_key(&mut self.cfg, player, button, code);
         self.input_map = InputMap::from_config(&self.cfg);
-        let Page::Settings { state } = &mut self.page else {
-            return true;
-        };
-        state.hint = Some(match config::save(&mut self.cfg) {
+        let hint = match config::save(&mut self.cfg) {
             Ok(()) => format!("已保存：{}", settings::key_label(Some(code))),
             Err(e) => format!("保存失败: {e:#}"),
-        });
+        };
+        if let Some(state) = self.settings_state_mut() {
+            state.hint = Some(hint);
+        }
         true
+    }
+
+    /// Toggles the in-game overlay: opening releases held input and pauses
+    /// local play; closing resumes and discards the embedded settings view.
+    fn toggle_game_menu(&mut self) {
+        match &mut self.page {
+            Page::Playing { session, net, menu } => {
+                menu.open = !menu.open;
+                if menu.open {
+                    session.clear_input();
+                } else {
+                    menu.settings = None;
+                }
+                // Only local play truly pauses; a host game keeps running for peers.
+                session.set_paused(menu.open && net.is_none());
+            }
+            Page::GuestPlaying { play, menu, .. } => {
+                menu.open = !menu.open;
+                if menu.open {
+                    play.clear_input();
+                } else {
+                    menu.settings = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Runs one egui frame and submits it to wgpu.
@@ -664,46 +745,55 @@ impl ApplicationHandler for PlaymateApp {
         // Intercept exact KeyCode events before egui for gameplay and rebinding.
         // This preserves numpad distinctions that egui's key model does not expose.
         let mut consumed_by_game = false;
-        let mut exit_game = false;
-        let mut exit_guest = false;
+        let mut toggle_menu = false;
         if let WindowEvent::KeyboardInput {
             event: key_event, ..
         } = &event
             && let PhysicalKey::Code(code) = key_event.physical_key
         {
             let pressed = key_event.state == ElementState::Pressed;
-            match &mut self.page {
-                Page::Playing { session, .. } => {
-                    if code == KeyCode::Escape {
-                        exit_game = pressed;
-                        consumed_by_game = true;
-                    } else {
-                        consumed_by_game = session.on_key(&self.input_map, code, pressed);
+            // Holding Esc must not rapidly toggle the menu through key repeats.
+            let toggle = pressed && !key_event.repeat;
+            let menu_open = matches!(
+                &self.page,
+                Page::Playing { menu, .. } | Page::GuestPlaying { menu, .. } if menu.open
+            );
+            if menu_open {
+                // The overlay owns the keyboard: rebinding capture first for
+                // the embedded settings view, then Esc closes the menu.
+                if pressed && self.handle_rebind_capture(code) {
+                    consumed_by_game = true;
+                } else if code == KeyCode::Escape {
+                    toggle_menu = toggle;
+                    consumed_by_game = true;
+                }
+            } else {
+                match &mut self.page {
+                    Page::Playing { session, .. } => {
+                        if code == KeyCode::Escape {
+                            toggle_menu = toggle;
+                            consumed_by_game = true;
+                        } else {
+                            consumed_by_game = session.on_key(&self.input_map, code, pressed);
+                        }
                     }
-                }
-                Page::GuestPlaying { play, .. } => {
-                    if code == KeyCode::Escape {
-                        exit_guest = pressed;
-                        consumed_by_game = true;
-                    } else {
-                        consumed_by_game = play.on_key(&self.input_map, code, pressed);
+                    Page::GuestPlaying { play, .. } => {
+                        if code == KeyCode::Escape {
+                            toggle_menu = toggle;
+                            consumed_by_game = true;
+                        } else {
+                            consumed_by_game = play.on_key(&self.input_map, code, pressed);
+                        }
                     }
+                    Page::Settings { .. } if pressed => {
+                        consumed_by_game = self.handle_rebind_capture(code);
+                    }
+                    _ => {}
                 }
-                Page::Settings { .. } if pressed => {
-                    consumed_by_game = self.handle_rebind_capture(code);
-                }
-                _ => {}
             }
         }
-        if exit_game {
-            // Local play returns to the menu; a host ends the game but retains the room.
-            self.apply_nav(Nav::BackToRoom);
-        }
-        if exit_guest {
-            // A client leaving gameplay disconnects and returns to the lobby.
-            self.page = Page::LanLobby {
-                state: LobbyState::new(),
-            };
+        if toggle_menu {
+            self.toggle_game_menu();
         }
 
         if !consumed_by_game && let Some(state) = &mut self.egui_state {
@@ -734,10 +824,10 @@ impl ApplicationHandler for PlaymateApp {
         self.gamepad.poll();
         match &mut self.page {
             // Local play and hosts publish merged input directly to emulation.
-            Page::Playing { session, .. } => session.sync_input(&self.gamepad),
+            Page::Playing { session, menu, .. } => session.sync_input(&self.gamepad, menu.open),
             // Clients send changed merged input to the host through the network task.
-            Page::GuestPlaying { play, net } => {
-                if let Some(buttons) = play.poll_outgoing(&self.gamepad) {
+            Page::GuestPlaying { play, net, menu } => {
+                if let Some(buttons) = play.poll_outgoing(&self.gamepad, menu.open) {
                     net.handle.send(RoomCmd::Input(buttons));
                 }
             }
@@ -747,6 +837,24 @@ impl ApplicationHandler for PlaymateApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+}
+
+/// Restores default key bindings, rebuilds the lookup table, saves the
+/// configuration, and reports the result on the given settings view.
+fn restore_default_keys(
+    cfg: &mut Config,
+    input_map: &mut InputMap,
+    state: Option<&mut SettingsState>,
+) {
+    cfg.keys = Default::default();
+    *input_map = InputMap::from_config(cfg);
+    let hint = match config::save(cfg) {
+        Ok(()) => "已恢复默认键位".to_string(),
+        Err(e) => format!("保存失败: {e:#}"),
+    };
+    if let Some(state) = state {
+        state.hint = Some(hint);
     }
 }
 

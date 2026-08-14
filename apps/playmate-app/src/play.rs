@@ -121,22 +121,38 @@ impl PlaySession {
 
     /// Merges keyboard and gamepad bitmaps and publishes them once per frame.
     /// Local play controls both slots; netplay writes only the local slot.
-    pub fn sync_input(&self, gamepad: &GamepadInput) {
+    /// `blocked` publishes released buttons instead, used while the in-game
+    /// menu is open; a remote player's slot is never touched.
+    pub fn sync_input(&self, gamepad: &GamepadInput, blocked: bool) {
         match self.net_local_slot {
             None => {
                 for player in [Player::One, Player::Two] {
                     let merged =
                         self.keyboard[Self::index(player)].bits() | gamepad.state(player).bits();
-                    self.buttons_cell(player).store(merged, Ordering::Relaxed);
+                    let value = if blocked { 0 } else { merged };
+                    self.buttons_cell(player).store(value, Ordering::Relaxed);
                 }
             }
             Some(local) => {
                 // In netplay, the first local gamepad controls the local slot.
                 let merged =
                     self.keyboard[Self::index(local)].bits() | gamepad.state(Player::One).bits();
-                self.buttons_cell(local).store(merged, Ordering::Relaxed);
+                let value = if blocked { 0 } else { merged };
+                self.buttons_cell(local).store(value, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Releases all locally held keyboard buttons, used when the in-game menu
+    /// opens so keys held at that moment do not stay latched.
+    pub fn clear_input(&mut self) {
+        self.keyboard = [ButtonState::empty(); 2];
+    }
+
+    /// Pauses or resumes the emulation thread. Only local play pauses; a
+    /// netplay host keeps running because peers cannot be paused.
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Returns the shared input cell for a player slot.
@@ -252,13 +268,24 @@ impl GuestPlay {
         true
     }
 
+    /// Releases all locally held keyboard buttons, used when the in-game menu
+    /// opens so keys held at that moment do not stay latched.
+    pub fn clear_input(&mut self) {
+        self.keyboard = ButtonState::empty();
+    }
+
     /// Merges keyboard and gamepad input, returning changes for the network task.
-    /// Spectators never produce outgoing input.
-    pub fn poll_outgoing(&mut self, gamepad: &GamepadInput) -> Option<u8> {
+    /// Spectators never produce outgoing input. `blocked` reports released
+    /// buttons instead, used while the in-game menu is open.
+    pub fn poll_outgoing(&mut self, gamepad: &GamepadInput, blocked: bool) -> Option<u8> {
         if self.spectator {
             return None;
         }
-        let merged = self.keyboard.bits() | gamepad.state(Player::One).bits();
+        let merged = if blocked {
+            0
+        } else {
+            self.keyboard.bits() | gamepad.state(Player::One).bits()
+        };
         if merged != self.last_sent {
             self.last_sent = merged;
             Some(merged)
