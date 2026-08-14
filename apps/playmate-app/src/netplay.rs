@@ -14,7 +14,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use playmate_core::{FRAME_BYTES, Player};
 use playmate_net::codec::{FrameDecoder, FrameEncoder, f32_to_i16_bytes, i16_bytes_to_f32};
@@ -209,20 +209,41 @@ pub fn spawn_guest(
     RoomHandle { cmd_tx, event_rx }
 }
 
+/// Error representing a peer that stopped responding.
+fn idle_timeout_error() -> NetError {
+    NetError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "对端超时无响应",
+    ))
+}
+
 /// Reads a message with a timeout; timeout is treated as disconnection.
-/// Reads go through a cancel-safe `MessageReader`, so `select!` loops may
-/// drop this future mid-read without desynchronizing the stream.
+///
+/// Only for dedicated reader tasks that loop on this call alone: the timeout
+/// restarts on every call, so racing it inside a `select!` would let other
+/// arms (heartbeat, commands) reset it before it can ever fire. Select loops
+/// must use [`read_alive`] plus an explicit liveness check instead.
 async fn read_idle(
     reader: &mut MessageReader,
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<Message, NetError> {
     match timeout(IDLE_TIMEOUT, reader.next(stream)).await {
         Ok(result) => Ok(result?),
-        Err(_) => Err(NetError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "对端超时无响应",
-        ))),
+        Err(_) => Err(idle_timeout_error()),
     }
+}
+
+/// Reads the next message and stamps the liveness clock on success.
+/// Cancel-safe like `MessageReader::next`; the stamp only happens when this
+/// future completes, i.e. when its `select!` arm wins.
+async fn read_alive(
+    reader: &mut MessageReader,
+    stream: &mut (impl AsyncRead + Unpin),
+    last_recv: &mut Instant,
+) -> Result<Message, NetError> {
+    let msg = reader.next(stream).await?;
+    *last_recv = Instant::now();
+    Ok(msg)
 }
 
 /// Media context for an active game.
@@ -241,6 +262,14 @@ struct GameContext {
     shared: Arc<SharedState>,
     /// Remote player slot, fixed when the game starts and retained across reconnects.
     remote_slot: Player,
+}
+
+/// Returns the shared input cell for the remote player's slot.
+fn remote_buttons_cell(ctx: &GameContext) -> &std::sync::atomic::AtomicU8 {
+    match ctx.remote_slot {
+        Player::One => &ctx.shared.p1_buttons,
+        Player::Two => &ctx.shared.p2_buttons,
+    }
 }
 
 /// Maximum simultaneous spectators.
@@ -286,7 +315,7 @@ async fn host_task(
             Some(peer) = joined_rx.recv() => room.register(peer, game.as_ref()),
             Some(input) = in_rx.recv() => match input {
                 ConnIn::Msg(id, msg) => room.on_message(id, msg, game.as_ref(), &seats),
-                ConnIn::Closed(id) => room.remove(id, &seats),
+                ConnIn::Closed(id) => room.remove(id, &seats, game.as_ref()),
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(cmd) => room.on_command(cmd, &mut game, &seats),
@@ -543,6 +572,9 @@ struct SeatPending {
     spectator_id: u64,
     /// Requesting spectator's display name.
     spectator_name: String,
+    /// Whether the seated player arbitrates (`true`) or the host does for an
+    /// empty seat (`false`). Each answer path only consumes its own kind.
+    via_player: bool,
 }
 
 /// Room state owned by the host loop: registered connections, slot
@@ -646,7 +678,7 @@ impl HostRoom {
     }
 
     /// Removes a closed connection, frees its seat, and publishes the roster.
-    fn remove(&mut self, id: u64, seats: &Arc<Mutex<Seats>>) {
+    fn remove(&mut self, id: u64, seats: &Arc<Mutex<Seats>>, game: Option<&GameContext>) {
         let Some(pos) = self.conns.iter().position(|c| c.id == id) else {
             return;
         };
@@ -655,6 +687,11 @@ impl HostRoom {
         log::info!("connection closed: {} ({:?})", conn.name, conn.role);
         if conn.role == JoinRole::Player {
             self.swap_pending = None;
+            // Input messages replace the whole button state, so buttons held
+            // at disconnect would stay pressed in emulation forever.
+            if let Some(ctx) = game {
+                remote_buttons_cell(ctx).store(0, Ordering::Relaxed);
+            }
             let _ = self.event_tx.send(RoomEvent::PeerLeft);
         }
         // Cancel a seat negotiation that involves the leaving connection.
@@ -687,11 +724,7 @@ impl HostRoom {
             Message::Input { buttons } => {
                 // Spectators never control the game.
                 if from_player && let Some(ctx) = game {
-                    let cell = match ctx.remote_slot {
-                        Player::One => &ctx.shared.p1_buttons,
-                        Player::Two => &ctx.shared.p2_buttons,
-                    };
-                    cell.store(buttons, Ordering::Relaxed);
+                    remote_buttons_cell(ctx).store(buttons, Ordering::Relaxed);
                 }
             }
             Message::SwapRequest if from_player => {
@@ -719,7 +752,8 @@ impl HostRoom {
                 self.on_seat_request(id, game.is_some());
             }
             Message::SeatChangeResponse { accepted } if from_player => {
-                if let Some(pending) = self.seat_pending.take() {
+                // Only consume a negotiation this player actually arbitrates.
+                if let Some(pending) = self.seat_pending.take_if(|p| p.via_player) {
                     self.finish_seat_change(pending, accepted, true, seats);
                 }
             }
@@ -744,11 +778,13 @@ impl HostRoom {
             self.send_to(id, Message::SeatChangeResponse { accepted: false });
             return;
         }
+        let via_player = self.player().is_some();
         self.seat_pending = Some(SeatPending {
             spectator_id: id,
             spectator_name: name.clone(),
+            via_player,
         });
-        if self.player().is_some() {
+        if via_player {
             self.send_player(Message::SeatChangeRequest { spectator: name });
         } else {
             let _ = self
@@ -824,11 +860,12 @@ impl HostRoom {
     ) {
         match cmd {
             RoomCmd::RespondSeat(accepted) => {
-                // Only meaningful for the empty-seat promotion the host
-                // approves; a seated player answers through its own client.
-                if self.player().is_none()
-                    && let Some(pending) = self.seat_pending.take()
-                {
+                // Empty-seat promotion arbitrated by the host. Always consume
+                // the host-arbitrated pending state — gating on the seat still
+                // being empty would leave it stuck forever when a new player
+                // joined mid-decision; finish_seat_change already declines
+                // that race via its seat_raced check.
+                if let Some(pending) = self.seat_pending.take_if(|p| !p.via_player) {
                     self.finish_seat_change(pending, accepted, false, seats);
                 }
             }
@@ -1020,13 +1057,17 @@ async fn guest_connection(
     role: &mut JoinRole,
 ) -> Result<(), NetError> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // The game loop can occupy an arm body for a long time; firing every
+    // missed tick afterwards would burst-send stale pings.
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut swap_pending: Option<SwapInitiator> = None;
     // One reader for the connection's whole lifetime: its buffer may hold a
     // prefix of the next message, so the game loop shares it too.
     let mut reader = MessageReader::new();
+    let mut last_recv = Instant::now();
     loop {
         tokio::select! {
-            msg = read_idle(&mut reader, &mut stream) => match msg? {
+            msg = read_alive(&mut reader, &mut stream, &mut last_recv) => match msg? {
                 Message::SlotState { host_is_p1 } => {
                     // The client occupies the slot opposite the host.
                     let my_slot = if host_is_p1 { Player::Two } else { Player::One };
@@ -1085,7 +1126,10 @@ async fn guest_connection(
                     {
                         GuestGameEnd::UiLeft => return Ok(()),
                         GuestGameEnd::HostEnded => {
-                            // The host ended the game; return to the room loop on the same connection.
+                            // The host ended the game; return to the room loop
+                            // on the same connection. The liveness clock is
+                            // stale from before the game, so restart it.
+                            last_recv = Instant::now();
                             let _ = event_tx.send(RoomEvent::GameEnded);
                         }
                     }
@@ -1125,6 +1169,12 @@ async fn guest_connection(
                 None => return Ok(()), // The UI left the room.
             },
             _ = heartbeat.tick() => {
+                // Idle disconnection is detected here: a timeout inside the
+                // read arm would be recreated (and thus reset) every time
+                // another arm wins the select.
+                if last_recv.elapsed() >= IDLE_TIMEOUT {
+                    return Err(idle_timeout_error());
+                }
                 Message::Ping.write_to(&mut stream).await?;
             }
         }
@@ -1150,9 +1200,10 @@ async fn guest_game_loop(
 ) -> Result<GuestGameEnd, NetError> {
     let mut decoder = FrameDecoder::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut last_recv = Instant::now();
     loop {
         tokio::select! {
-            msg = read_idle(reader, stream) => match msg? {
+            msg = read_alive(reader, stream, &mut last_recv) => match msg? {
                 Message::Frame { keyframe, data, .. } => {
                     let fb = decoder.decode(keyframe, &data)?;
                     if let Ok(mut lock) = framebuffer.lock()
@@ -1176,6 +1227,11 @@ async fn guest_game_loop(
                 None => return Ok(GuestGameEnd::UiLeft),
             },
             _ = heartbeat.tick() => {
+                // See guest_connection: liveness must be checked outside the
+                // read arm because select! recreates that future per iteration.
+                if last_recv.elapsed() >= IDLE_TIMEOUT {
+                    return Err(idle_timeout_error());
+                }
                 Message::Ping.write_to(stream).await?;
             }
         }
