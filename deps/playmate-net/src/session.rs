@@ -58,6 +58,19 @@ async fn read_timed(stream: &mut TcpStream) -> Result<Message, NetError> {
     }
 }
 
+/// Writes one message with a timeout mapped to an I/O `TimedOut` error.
+/// A peer that stops reading mid-handshake must not hang the task forever;
+/// on the host side that would permanently strand the seat claimed for it.
+async fn write_timed(stream: &mut TcpStream, msg: &Message) -> Result<(), NetError> {
+    match timeout(HANDSHAKE_TIMEOUT, msg.write_to(stream)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(NetError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "握手发送超时",
+        ))),
+    }
+}
+
 /// Completes the host-side handshake with one client.
 ///
 /// `seat_check` runs with the client's requested role after the pairing code
@@ -82,16 +95,18 @@ pub async fn pair_with_client(
     };
     if version != PROTOCOL_VERSION {
         let reason = format!("协议版本不匹配（主机 v{PROTOCOL_VERSION}，客户端 v{version}）");
-        Message::Reject {
-            reason: reason.clone(),
-        }
-        .write_to(stream)
+        write_timed(
+            stream,
+            &Message::Reject {
+                reason: reason.clone(),
+            },
+        )
         .await?;
         return Err(NetError::Rejected(reason));
     }
 
     // Step 2: validate the pairing code.
-    Message::Challenge.write_to(stream).await?;
+    write_timed(stream, &Message::Challenge).await?;
     let code = match read_timed(stream).await? {
         Message::PairCode { code } => code,
         other => {
@@ -100,28 +115,34 @@ pub async fn pair_with_client(
     };
     if code != pair_code {
         let reason = "配对码错误".to_string();
-        Message::Reject {
-            reason: reason.clone(),
-        }
-        .write_to(stream)
+        write_timed(
+            stream,
+            &Message::Reject {
+                reason: reason.clone(),
+            },
+        )
         .await?;
         return Err(NetError::Rejected(reason));
     }
 
     // Step 3: let the caller claim a seat for the requested role.
     if let Err(reason) = seat_check(role) {
-        Message::Reject {
-            reason: reason.clone(),
-        }
-        .write_to(stream)
+        write_timed(
+            stream,
+            &Message::Reject {
+                reason: reason.clone(),
+            },
+        )
         .await?;
         return Err(NetError::Rejected(reason));
     }
 
-    Message::Welcome {
-        rom_name: rom_name.to_string(),
-    }
-    .write_to(stream)
+    write_timed(
+        stream,
+        &Message::Welcome {
+            rom_name: rom_name.to_string(),
+        },
+    )
     .await?;
     Ok((peer_name, role))
 }
@@ -136,10 +157,12 @@ pub async fn reject_client(stream: &mut TcpStream, reason: &str) -> Result<(), N
         Message::Hello { .. } => {}
         other => return Err(NetError::Protocol(format!("预期 Hello，收到 {other:?}"))),
     }
-    Message::Reject {
-        reason: reason.to_owned(),
-    }
-    .write_to(stream)
+    write_timed(
+        stream,
+        &Message::Reject {
+            reason: reason.to_owned(),
+        },
+    )
     .await?;
     Ok(())
 }
@@ -164,12 +187,14 @@ pub async fn client_connect(
     };
     stream.set_nodelay(true)?;
 
-    Message::Hello {
-        version: PROTOCOL_VERSION,
-        name: client_name.to_string(),
-        role,
-    }
-    .write_to(&mut stream)
+    write_timed(
+        &mut stream,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+            name: client_name.to_string(),
+            role,
+        },
+    )
     .await?;
 
     match read_timed(&mut stream).await? {
@@ -182,10 +207,12 @@ pub async fn client_connect(
         }
     }
 
-    Message::PairCode {
-        code: code_provider(),
-    }
-    .write_to(&mut stream)
+    write_timed(
+        &mut stream,
+        &Message::PairCode {
+            code: code_provider(),
+        },
+    )
     .await?;
 
     match read_timed(&mut stream).await? {
