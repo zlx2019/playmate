@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use playmate_core::Player;
 
@@ -44,9 +45,16 @@ pub struct RoomState {
     pub selected: Option<usize>,
     /// User-facing error or status message.
     pub error: Option<String>,
+    /// Waiting for the peer to answer the local swap request.
+    pub swap_outgoing: bool,
+    /// Auto-decline deadline of the peer's pending swap request.
+    pub swap_incoming: Option<Instant>,
     /// Host mDNS advertisement retained until this state is dropped.
     pub _announcer: Option<playmate_net::Announcer>,
 }
+
+/// How long an incoming swap request waits before it is declined automatically.
+const SWAP_PROMPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Action triggered by the room page.
 pub enum RoomAction {
@@ -85,7 +93,21 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 // A connected client necessarily has the host as its peer.
                 state.peer = Some("主机".to_string());
             }
-            RoomEvent::MySlot(slot) => state.my_slot = slot,
+            RoomEvent::MySlot(slot) => {
+                state.my_slot = slot;
+                // Any authoritative slot broadcast settles the negotiation.
+                state.swap_outgoing = false;
+                state.swap_incoming = None;
+            }
+            RoomEvent::SwapRequested => {
+                // A crossing local request was absorbed by the network task.
+                state.swap_outgoing = false;
+                state.swap_incoming = Some(Instant::now() + SWAP_PROMPT_TIMEOUT);
+            }
+            RoomEvent::SwapDeclined => {
+                state.swap_outgoing = false;
+                state.error = Some("对方拒绝了交换席位的请求".to_string());
+            }
             RoomEvent::GameStarted {
                 rom_name,
                 sample_rate,
@@ -102,6 +124,8 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
             RoomEvent::GameEnded => updates.game_ended = true,
             RoomEvent::Reconnecting { attempt } => {
                 state.error = Some(format!("连接中断，正在自动重连…（第 {attempt} 次）"));
+                state.swap_outgoing = false;
+                state.swap_incoming = None;
             }
             RoomEvent::Reconnected => {
                 state.error = None;
@@ -115,6 +139,8 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 } else {
                     "与主机断开连接".to_string()
                 });
+                state.swap_outgoing = false;
+                state.swap_incoming = None;
             }
             // `Failed` means the network task ended, so the application must return to the lobby.
             RoomEvent::Failed(reason) => updates.fatal = Some(reason),
@@ -172,12 +198,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
                 None => slot_row(ui, "等待玩家加入…", None, false),
             }
             ui.add_space(10.0);
-            if ui
-                .add_enabled(state.peer.is_some(), egui::Button::new("↔ 交换 P1 / P2"))
-                .clicked()
-            {
-                state.handle.send(RoomCmd::SwapSlots);
-            }
+            show_swap_controls(ui, state);
         });
         ui.add_space(10.0);
 
@@ -238,6 +259,48 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
         }
     });
     action
+}
+
+/// Swap controls in one of three states: the request button, waiting for the
+/// peer's answer, or the peer's request with accept/decline and a countdown.
+fn show_swap_controls(ui: &mut egui::Ui, state: &mut RoomState) {
+    if let Some(deadline) = state.swap_incoming {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Unanswered prompts decline automatically at the deadline.
+            state.handle.send(RoomCmd::RespondSwap(false));
+            state.swap_incoming = None;
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "对方请求交换 P1 / P2（{} 秒后自动拒绝）",
+                    remaining.as_secs() + 1
+                ))
+                .color(theme::RED_BRIGHT),
+            );
+            if ui.button("同意").clicked() {
+                state.handle.send(RoomCmd::RespondSwap(true));
+                state.swap_incoming = None;
+            }
+            if ui.button("拒绝").clicked() {
+                state.handle.send(RoomCmd::RespondSwap(false));
+                state.swap_incoming = None;
+            }
+        });
+    } else if state.swap_outgoing {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(egui::RichText::new("等待对方同意交换…").color(theme::TEXT_WEAK));
+        });
+    } else if ui
+        .add_enabled(state.peer.is_some(), egui::Button::new("↔ 交换 P1 / P2"))
+        .clicked()
+    {
+        state.handle.send(RoomCmd::RequestSwap);
+        state.swap_outgoing = true;
+    }
 }
 
 /// One player row containing a slot badge and name.

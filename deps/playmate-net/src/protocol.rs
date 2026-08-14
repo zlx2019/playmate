@@ -17,7 +17,8 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Protocol version, validated during the handshake.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// v2: `SwapSlots` replaced by the consent-based `SwapRequest`/`SwapResponse` pair.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum message size: 16 MiB, well above an uncompressed frame.
 /// This prevents a corrupted length field from exhausting memory.
@@ -54,8 +55,14 @@ pub enum Message {
     Ping,
     /// Keepalive response.
     Pong,
-    /// Requests a P1/P2 slot swap; either side may request and the host arbitrates.
-    SwapSlots,
+    /// Requests a P1/P2 slot swap; the other side must accept before it happens.
+    SwapRequest,
+    /// Answer to `SwapRequest`; on acceptance the host flips the slots and
+    /// broadcasts the new `SlotState`.
+    SwapResponse {
+        /// Whether the peer agreed to the swap.
+        accepted: bool,
+    },
     /// Host broadcast of the current slot assignment.
     SlotState {
         /// Whether the host occupies P1; false means host=P2 and client=P1.
@@ -100,13 +107,14 @@ mod tag {
     pub const REJECT: u8 = 5;
     pub const PING: u8 = 6;
     pub const PONG: u8 = 7;
-    pub const SWAP_SLOTS: u8 = 8;
+    pub const SWAP_REQUEST: u8 = 8;
     pub const SLOT_STATE: u8 = 9;
     pub const GAME_START: u8 = 10;
     pub const FRAME: u8 = 11;
     pub const AUDIO_CHUNK: u8 = 12;
     pub const INPUT: u8 = 13;
     pub const GAME_END: u8 = 14;
+    pub const SWAP_RESPONSE: u8 = 15;
 }
 
 impl Message {
@@ -157,7 +165,11 @@ impl Message {
             }
             Message::Ping => tag::PING,
             Message::Pong => tag::PONG,
-            Message::SwapSlots => tag::SWAP_SLOTS,
+            Message::SwapRequest => tag::SWAP_REQUEST,
+            Message::SwapResponse { accepted } => {
+                payload.push(u8::from(*accepted));
+                tag::SWAP_RESPONSE
+            }
             Message::SlotState { host_is_p1 } => {
                 payload.push(u8::from(*host_is_p1));
                 tag::SLOT_STATE
@@ -215,7 +227,13 @@ impl Message {
             },
             tag::PING => Message::Ping,
             tag::PONG => Message::Pong,
-            tag::SWAP_SLOTS => Message::SwapSlots,
+            tag::SWAP_REQUEST => Message::SwapRequest,
+            tag::SWAP_RESPONSE => {
+                let flag = take(&mut rest, 1)?;
+                Message::SwapResponse {
+                    accepted: flag[0] != 0,
+                }
+            }
             tag::SLOT_STATE => {
                 let flag = take(&mut rest, 1)?;
                 Message::SlotState {
@@ -314,7 +332,9 @@ mod tests {
             },
             Message::Ping,
             Message::Pong,
-            Message::SwapSlots,
+            Message::SwapRequest,
+            Message::SwapResponse { accepted: true },
+            Message::SwapResponse { accepted: false },
             Message::SlotState { host_is_p1: false },
             Message::GameStart {
                 rom_name: "River City Ransom.nes".to_string(),

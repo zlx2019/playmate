@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use playmate_core::{FRAME_BYTES, Player};
 use playmate_net::codec::{FrameDecoder, FrameEncoder, f32_to_i16_bytes, i16_bytes_to_f32};
-use playmate_net::{ClientSession, Message, NetError, host_wait_for_peer};
+use playmate_net::{ClientSession, Message, NetError, host_wait_for_peer, reject_client};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::time::timeout;
@@ -34,8 +34,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Commands from the UI to the network task.
 pub enum RoomCmd {
-    /// Requests a P1/P2 slot swap.
-    SwapSlots,
+    /// Asks the peer for a P1/P2 slot swap.
+    RequestSwap,
+    /// Answers the peer's pending swap request.
+    RespondSwap(bool),
     /// Host command to start a game with emulation media and shared state.
     StartGame {
         /// Game title displayed by the client.
@@ -89,10 +91,22 @@ pub enum RoomEvent {
     },
     /// Automatic reconnection succeeded; `GameStarted` follows if a game is still active.
     Reconnected,
+    /// The peer asked for a slot swap and awaits the local user's answer.
+    SwapRequested,
+    /// The peer declined the local user's swap request.
+    SwapDeclined,
     /// The peer left or disconnected; the host continues waiting for another player.
     PeerLeft,
     /// Session failure with a human-readable connection, rejection, or retry reason.
     Failed(String),
+}
+
+/// Which side initiated the swap negotiation currently in flight.
+enum SwapInitiator {
+    /// The local UI asked and awaits the peer's answer.
+    Local,
+    /// The peer asked and awaits the local UI's answer.
+    Remote,
 }
 
 /// UI-owned room session handle; dropping it leaves the room.
@@ -207,6 +221,7 @@ async fn host_task(
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<RoomCmd>,
     event_tx: std_mpsc::Sender<RoomEvent>,
 ) {
+    let listener = Arc::new(listener);
     let mut game: Option<GameContext> = None;
     loop {
         let session = tokio::select! {
@@ -230,16 +245,34 @@ async fn host_task(
             name: session.peer_name.clone(),
         });
 
-        if host_connection(session.stream, &mut cmd_rx, &event_tx, &mut game)
-            .await
-            .is_err()
-        {
+        // While the seat is taken, answer newcomers with an immediate
+        // "room full" reject instead of letting them rot in the accept backlog.
+        let bouncer = tokio::spawn(reject_newcomers(Arc::clone(&listener)));
+        let served = host_connection(session.stream, &mut cmd_rx, &event_tx, &mut game).await;
+        bouncer.abort();
+        if served.is_err() {
             let _ = event_tx.send(RoomEvent::PeerLeft);
         }
         if cmd_rx.is_closed() {
             return;
         }
         log::info!("returned to waiting state; ready for another player");
+    }
+}
+
+/// Rejects every connection that arrives while the room is occupied.
+/// Each handshake runs in its own task so one slow client cannot delay others.
+async fn reject_newcomers(listener: Arc<TcpListener>) {
+    loop {
+        let Ok((mut stream, addr)) = listener.accept().await else {
+            return;
+        };
+        log::info!("room full; rejecting newcomer: {addr}");
+        tokio::spawn(async move {
+            if let Err(e) = reject_client(&mut stream, "房间已满").await {
+                log::debug!("room-full reject handshake failed ({addr}): {e}");
+            }
+        });
     }
 }
 
@@ -284,22 +317,58 @@ async fn host_connection(
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut swap_pending: Option<SwapInitiator> = None;
     loop {
         tokio::select! {
             msg = read_idle(&mut stream) => match msg? {
-                Message::SwapSlots => {
-                    host_is_p1 = !host_is_p1;
-                    Message::SlotState { host_is_p1 }.write_to(&mut stream).await?;
-                    let _ = event_tx.send(RoomEvent::MySlot(host_slot(host_is_p1)));
+                Message::SwapRequest => {
+                    if matches!(swap_pending, Some(SwapInitiator::Local)) {
+                        // Both sides asked at the same time: agreement is implicit.
+                        swap_pending = None;
+                        host_is_p1 = !host_is_p1;
+                        Message::SwapResponse { accepted: true }.write_to(&mut stream).await?;
+                        Message::SlotState { host_is_p1 }.write_to(&mut stream).await?;
+                        let _ = event_tx.send(RoomEvent::MySlot(host_slot(host_is_p1)));
+                    } else {
+                        swap_pending = Some(SwapInitiator::Remote);
+                        let _ = event_tx.send(RoomEvent::SwapRequested);
+                    }
+                }
+                Message::SwapResponse { accepted } => {
+                    if matches!(swap_pending, Some(SwapInitiator::Local)) {
+                        swap_pending = None;
+                        if accepted {
+                            host_is_p1 = !host_is_p1;
+                            Message::SlotState { host_is_p1 }.write_to(&mut stream).await?;
+                            let _ = event_tx.send(RoomEvent::MySlot(host_slot(host_is_p1)));
+                        } else {
+                            let _ = event_tx.send(RoomEvent::SwapDeclined);
+                        }
+                    }
                 }
                 Message::Ping => Message::Pong.write_to(&mut stream).await?,
                 other => log::debug!("room loop ignored message: {other:?}"),
             },
             cmd = cmd_rx.recv() => match cmd {
-                Some(RoomCmd::SwapSlots) => {
-                    host_is_p1 = !host_is_p1;
-                    Message::SlotState { host_is_p1 }.write_to(&mut stream).await?;
-                    let _ = event_tx.send(RoomEvent::MySlot(host_slot(host_is_p1)));
+                Some(RoomCmd::RequestSwap) => {
+                    // Ignored while another negotiation is in flight.
+                    if swap_pending.is_none() {
+                        swap_pending = Some(SwapInitiator::Local);
+                        Message::SwapRequest.write_to(&mut stream).await?;
+                    }
+                }
+                Some(RoomCmd::RespondSwap(accepted)) => {
+                    if matches!(swap_pending, Some(SwapInitiator::Remote)) {
+                        swap_pending = None;
+                        // Answer first so the client clears its pending state
+                        // before the new SlotState lands.
+                        Message::SwapResponse { accepted }.write_to(&mut stream).await?;
+                        if accepted {
+                            host_is_p1 = !host_is_p1;
+                            Message::SlotState { host_is_p1 }.write_to(&mut stream).await?;
+                            let _ = event_tx.send(RoomEvent::MySlot(host_slot(host_is_p1)));
+                        }
+                    }
                 }
                 Some(RoomCmd::StartGame {
                     title,
@@ -514,6 +583,7 @@ async fn guest_connection(
     event_tx: &std_mpsc::Sender<RoomEvent>,
 ) -> Result<(), NetError> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut swap_pending: Option<SwapInitiator> = None;
     loop {
         tokio::select! {
             msg = read_idle(&mut stream) => match msg? {
@@ -521,6 +591,26 @@ async fn guest_connection(
                     // The client occupies the slot opposite the host.
                     let my_slot = if host_is_p1 { Player::Two } else { Player::One };
                     let _ = event_tx.send(RoomEvent::MySlot(my_slot));
+                }
+                Message::SwapRequest => {
+                    if matches!(swap_pending, Some(SwapInitiator::Local)) {
+                        // Both sides asked at the same time: agree and let the
+                        // host flip the slots and broadcast SlotState.
+                        swap_pending = None;
+                        Message::SwapResponse { accepted: true }.write_to(&mut stream).await?;
+                    } else {
+                        swap_pending = Some(SwapInitiator::Remote);
+                        let _ = event_tx.send(RoomEvent::SwapRequested);
+                    }
+                }
+                Message::SwapResponse { accepted } => {
+                    if matches!(swap_pending, Some(SwapInitiator::Local)) {
+                        swap_pending = None;
+                        // On acceptance the host flips and broadcasts SlotState next.
+                        if !accepted {
+                            let _ = event_tx.send(RoomEvent::SwapDeclined);
+                        }
+                    }
                 }
                 Message::GameStart { rom_name, sample_rate } => {
                     // Create shared buffers and enter the game loop immediately to catch the keyframe.
@@ -544,8 +634,19 @@ async fn guest_connection(
                 other => log::debug!("room loop ignored message: {other:?}"),
             },
             cmd = cmd_rx.recv() => match cmd {
-                Some(RoomCmd::SwapSlots) => {
-                    Message::SwapSlots.write_to(&mut stream).await?;
+                Some(RoomCmd::RequestSwap) => {
+                    // Ignored while another negotiation is in flight.
+                    if swap_pending.is_none() {
+                        swap_pending = Some(SwapInitiator::Local);
+                        Message::SwapRequest.write_to(&mut stream).await?;
+                    }
+                }
+                Some(RoomCmd::RespondSwap(accepted)) => {
+                    if matches!(swap_pending, Some(SwapInitiator::Remote)) {
+                        swap_pending = None;
+                        // The host flips the slots and broadcasts SlotState on acceptance.
+                        Message::SwapResponse { accepted }.write_to(&mut stream).await?;
+                    }
                 }
                 Some(_) => {}          // Other commands are irrelevant while the room is idle.
                 None => return Ok(()), // The UI left the room.
