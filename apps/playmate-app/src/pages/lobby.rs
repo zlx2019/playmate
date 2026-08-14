@@ -31,7 +31,13 @@ impl LobbyDiscovery {
                             return; // The UI dropped the receiver.
                         }
                     }
-                    Err(e) => log::warn!("failed to browse LAN rooms: {e}"),
+                    Err(e) => {
+                        log::warn!("failed to browse LAN rooms: {e}");
+                        // Back off instead of hammering (and starting daemons at
+                        // full speed) when mDNS keeps failing, e.g. when the
+                        // local-network permission is denied.
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
                 }
             }
         });

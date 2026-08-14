@@ -34,21 +34,34 @@ impl Announcer {
     /// `display_name` as the room name. mdns-sd discovers addresses automatically.
     pub fn start(instance: &str, port: u16, display_name: &str) -> Result<Self, NetError> {
         let daemon = ServiceDaemon::new()?;
-        let host_name = format!("{instance}.local.");
-        let properties = [("name", display_name)];
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            instance,
-            &host_name,
-            "",
-            port,
-            &properties[..],
-        )?
-        .enable_addr_auto();
-        let fullname = info.get_fullname().to_string();
-        daemon.register(info)?;
-        log::info!("mDNS advertisement started: {fullname} (port {port})");
-        Ok(Self { daemon, fullname })
+        // The daemon runs a background thread with no Drop; stop it manually
+        // on every early-error path or the thread leaks.
+        let registered = (|| {
+            let host_name = format!("{instance}.local.");
+            let properties = [("name", display_name)];
+            let info = ServiceInfo::new(
+                SERVICE_TYPE,
+                instance,
+                &host_name,
+                "",
+                port,
+                &properties[..],
+            )?
+            .enable_addr_auto();
+            let fullname = info.get_fullname().to_string();
+            daemon.register(info)?;
+            Ok::<String, NetError>(fullname)
+        })();
+        match registered {
+            Ok(fullname) => {
+                log::info!("mDNS advertisement started: {fullname} (port {port})");
+                Ok(Self { daemon, fullname })
+            }
+            Err(e) => {
+                let _ = daemon.shutdown();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -70,7 +83,14 @@ impl Drop for Announcer {
 /// threads. Wrap it in `tokio::task::spawn_blocking` from an async context.
 pub fn browse_rooms(timeout: Duration) -> Result<Vec<Room>, NetError> {
     let daemon = ServiceDaemon::new()?;
-    let receiver = daemon.browse(SERVICE_TYPE)?;
+    let receiver = match daemon.browse(SERVICE_TYPE) {
+        Ok(receiver) => receiver,
+        Err(e) => {
+            // The daemon thread has no Drop; stop it before propagating.
+            let _ = daemon.shutdown();
+            return Err(e.into());
+        }
+    };
     let deadline = Instant::now() + timeout;
     let mut rooms: Vec<Room> = Vec::new();
 

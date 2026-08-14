@@ -14,6 +14,10 @@ use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 use crate::NetError;
 
+/// Upper bound for a declared decompressed frame size. An NES frame is
+/// 256×240×4 ≈ 240 KiB, so anything claiming more is corruption.
+const MAX_RAW_FRAME: usize = 2 * 1024 * 1024;
+
 /// Host-side frame encoder that retains the previous raw frame for delta encoding.
 pub struct FrameEncoder {
     /// Previous raw frame; empty until the first keyframe has been emitted.
@@ -71,6 +75,15 @@ impl FrameDecoder {
     /// Decodes a frame and returns the reconstructed full-frame data.
     /// Receiving a delta frame before the first keyframe is a protocol error.
     pub fn decode(&mut self, keyframe: bool, data: &[u8]) -> Result<&[u8], NetError> {
+        // lz4 allocates a buffer of the declared size before validating the
+        // payload, so a corrupted prefix must be bounded here first.
+        let declared = data
+            .first_chunk::<4>()
+            .map(|b| u32::from_le_bytes(*b) as usize)
+            .ok_or_else(|| NetError::Protocol("帧数据缺少长度前缀".to_string()))?;
+        if declared > MAX_RAW_FRAME {
+            return Err(NetError::Protocol(format!("帧声明尺寸非法: {declared}")));
+        }
         let raw = decompress_size_prepended(data)
             .map_err(|e| NetError::Protocol(format!("帧解压失败: {e}")))?;
         if keyframe {
@@ -142,6 +155,18 @@ mod tests {
             );
             assert_eq!(decoder.decode(kf, &data).unwrap(), &frame[..]);
         }
+    }
+
+    /// A corrupted size prefix is rejected before any allocation happens.
+    #[test]
+    fn huge_size_prefix_is_rejected() {
+        let mut decoder = FrameDecoder::new();
+        // Claims ~2 GiB of decompressed data with a few junk bytes attached.
+        let mut data = 0x7FFF_FFFFu32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[1, 2, 3]);
+        assert!(decoder.decode(true, &data).is_err());
+        // Too short to even contain a size prefix.
+        assert!(decoder.decode(true, &[1, 2]).is_err());
     }
 
     /// A delta frame received before a keyframe must be rejected.
