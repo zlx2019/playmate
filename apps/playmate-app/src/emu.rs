@@ -15,6 +15,9 @@ use playmate_core::{ButtonState, FRAME_BYTES, NTSC_FPS, NesCore, Player};
 
 use crate::audio::AudioRing;
 
+/// Polling interval while paused, balancing resume latency and idle CPU use.
+const PAUSE_POLL: Duration = Duration::from_millis(25);
+
 /// Media output channels from emulation to the network sender in host mode.
 pub struct NetSink {
     /// Raw RGBA frames; the small bounded queue may drop frames rather than block emulation.
@@ -31,6 +34,8 @@ pub struct SharedState {
     pub p2_buttons: AtomicU8,
     /// Global running flag; clearing it stops emulation at the next frame boundary.
     pub running: AtomicBool,
+    /// Pause flag; the emulation thread idles without stepping while set.
+    pub paused: AtomicBool,
     /// Latest RGBA8 frame, always [`FRAME_BYTES`] bytes.
     pub framebuffer: Mutex<Vec<u8>>,
 }
@@ -42,6 +47,7 @@ impl SharedState {
             p1_buttons: AtomicU8::new(0),
             p2_buttons: AtomicU8::new(0),
             running: AtomicBool::new(true),
+            paused: AtomicBool::new(false),
             framebuffer: Mutex::new(vec![0u8; FRAME_BYTES]),
         }
     }
@@ -61,6 +67,14 @@ pub fn run_emulation(
     let mut next = Instant::now() + frame_dur;
 
     while shared.running.load(Ordering::Relaxed) {
+        // 0. Paused (local play): idle without stepping and hold the frame
+        // clock so resuming does not fast-forward the missed frames.
+        if shared.paused.load(Ordering::Relaxed) {
+            thread::sleep(PAUSE_POLL);
+            next = Instant::now() + frame_dur;
+            continue;
+        }
+
         // 1. Replace both players' input with the latest state.
         let p1 = ButtonState::from_bits(shared.p1_buttons.load(Ordering::Relaxed));
         let p2 = ButtonState::from_bits(shared.p2_buttons.load(Ordering::Relaxed));
