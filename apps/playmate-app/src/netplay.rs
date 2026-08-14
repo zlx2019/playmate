@@ -665,16 +665,21 @@ impl HostRoom {
         let _ = conn.ctrl_tx.send(WriterCtrl::Send(Message::SlotState {
             host_is_p1: self.host_is_p1,
         }));
+        self.conns.push(conn);
+        // Publish the roster before any GameStart so the joiner still handles
+        // it in the room loop rather than dropping it inside the game loop.
+        self.roster_changed();
         // A joiner during an active game enters it immediately; the fresh
         // writer encoder guarantees its first frame is a keyframe.
         if let Some(ctx) = game {
-            let _ = conn.ctrl_tx.send(WriterCtrl::Send(Message::GameStart {
-                rom_name: ctx.title.clone(),
-                sample_rate: ctx.sample_rate,
-            }));
+            self.send_to(
+                id,
+                Message::GameStart {
+                    rom_name: ctx.title.clone(),
+                    sample_rate: ctx.sample_rate,
+                },
+            );
         }
-        self.conns.push(conn);
-        self.roster_changed();
     }
 
     /// Removes a closed connection, frees its seat, and publishes the roster.
@@ -896,6 +901,13 @@ impl HostRoom {
                 shared,
                 remote_slot,
             } => {
+                // Gameplay freezes negotiation UI on every side, so resolve
+                // in-flight negotiations before switching to the game.
+                self.swap_pending = None;
+                if let Some(pending) = self.seat_pending.take() {
+                    let via_player = pending.via_player;
+                    self.finish_seat_change(pending, false, via_player, seats);
+                }
                 *game = Some(GameContext {
                     title: title.clone(),
                     sample_rate,
@@ -1121,8 +1133,15 @@ async fn guest_connection(
                         framebuffer: Arc::clone(&framebuffer),
                         ring: Arc::clone(&ring),
                     });
-                    match guest_game_loop(&mut reader, &mut stream, cmd_rx, &framebuffer, &ring)
-                        .await?
+                    match guest_game_loop(
+                        &mut reader,
+                        &mut stream,
+                        cmd_rx,
+                        event_tx,
+                        &framebuffer,
+                        &ring,
+                    )
+                    .await?
                     {
                         GuestGameEnd::UiLeft => return Ok(()),
                         GuestGameEnd::HostEnded => {
@@ -1195,6 +1214,7 @@ async fn guest_game_loop(
     reader: &mut MessageReader,
     stream: &mut TcpStream,
     cmd_rx: &mut tokio_mpsc::UnboundedReceiver<RoomCmd>,
+    event_tx: &std_mpsc::Sender<RoomEvent>,
     framebuffer: &Arc<Mutex<Vec<u8>>>,
     ring: &Arc<AudioRing>,
 ) -> Result<GuestGameEnd, NetError> {
@@ -1214,6 +1234,11 @@ async fn guest_game_loop(
                 }
                 Message::AudioChunk { data } => {
                     ring.push(&i16_bytes_to_f32(&data));
+                }
+                Message::Roster { player, spectators } => {
+                    // Membership can change mid-game (spectators joining or
+                    // leaving); keep the room page state current for later.
+                    let _ = event_tx.send(RoomEvent::Roster { player, spectators });
                 }
                 Message::GameEnd => return Ok(GuestGameEnd::HostEnded),
                 Message::Ping => Message::Pong.write_to(stream).await?,

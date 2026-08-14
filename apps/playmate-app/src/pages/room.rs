@@ -43,8 +43,11 @@ pub struct RoomState {
     pub games: Vec<GameEntry>,
     /// Host's selected game index.
     pub selected: Option<usize>,
-    /// User-facing error or status message.
+    /// User-facing error message, rendered as a red banner.
     pub error: Option<String>,
+    /// Informational status message, kept separate from `error` so routine
+    /// notices (declines, role changes) never render as failures.
+    pub notice: Option<String>,
     /// Waiting for the peer to answer the local swap request.
     pub swap_outgoing: bool,
     /// Auto-decline deadline of the peer's pending swap request.
@@ -119,7 +122,7 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
             }
             RoomEvent::SwapDeclined => {
                 state.swap_outgoing = false;
-                state.error = Some("对方拒绝了交换席位的请求".to_string());
+                state.notice = Some("对方拒绝了交换席位的请求".to_string());
             }
             RoomEvent::Roster { player, spectators } => {
                 state.roster_player = player;
@@ -130,7 +133,7 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
             }
             RoomEvent::SeatDeclined => {
                 state.seat_outgoing = false;
-                state.error = Some("上场请求被拒绝".to_string());
+                state.notice = Some("上场请求被拒绝".to_string());
             }
             RoomEvent::RoleChanged { is_spectator } => {
                 state.is_spectator = is_spectator;
@@ -138,7 +141,7 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 state.seat_incoming = None;
                 state.swap_outgoing = false;
                 state.swap_incoming = None;
-                state.error = Some(if is_spectator {
+                state.notice = Some(if is_spectator {
                     "你已与观众互换位置，转为观战".to_string()
                 } else {
                     "你已上场，成为玩家".to_string()
@@ -151,6 +154,14 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 framebuffer,
                 ring,
             } => {
+                // Entering gameplay: stale messages and negotiation prompts
+                // must not carry into (or back out of) the game page.
+                state.error = None;
+                state.notice = None;
+                state.swap_outgoing = false;
+                state.swap_incoming = None;
+                state.seat_outgoing = false;
+                state.seat_incoming = None;
                 updates.start = Some(StartInfo {
                     rom_name,
                     sample_rate,
@@ -218,6 +229,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
 
         if let Some(err) = &state.error {
             theme::error_banner(ui, err);
+            ui.add_space(6.0);
+        }
+        if let Some(notice) = &state.notice {
+            ui.label(egui::RichText::new(notice).color(theme::GREEN));
             ui.add_space(6.0);
         }
 
