@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use playmate_core::{FRAME_BYTES, Player};
 use playmate_net::codec::{FrameDecoder, FrameEncoder, f32_to_i16_bytes, i16_bytes_to_f32};
-use playmate_net::{ClientSession, JoinRole, Message, NetError, pair_with_client};
+use playmate_net::{ClientSession, JoinRole, Message, MessageReader, NetError, pair_with_client};
 use tokio::io::AsyncRead;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -210,8 +210,13 @@ pub fn spawn_guest(
 }
 
 /// Reads a message with a timeout; timeout is treated as disconnection.
-async fn read_idle(stream: &mut (impl AsyncRead + Unpin)) -> Result<Message, NetError> {
-    match timeout(IDLE_TIMEOUT, Message::read_from(stream)).await {
+/// Reads go through a cancel-safe `MessageReader`, so `select!` loops may
+/// drop this future mid-read without desynchronizing the stream.
+async fn read_idle(
+    reader: &mut MessageReader,
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<Message, NetError> {
+    match timeout(IDLE_TIMEOUT, reader.next(stream)).await {
         Ok(result) => Ok(result?),
         Err(_) => Err(NetError::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -461,8 +466,9 @@ async fn conn_reader(
     id: u64,
     in_tx: tokio_mpsc::UnboundedSender<ConnIn>,
 ) {
+    let mut reader = MessageReader::new();
     loop {
-        match read_idle(&mut read_half).await {
+        match read_idle(&mut reader, &mut read_half).await {
             Ok(msg) => {
                 if in_tx.send(ConnIn::Msg(id, msg)).is_err() {
                     return; // The host loop exited.
@@ -1015,9 +1021,12 @@ async fn guest_connection(
 ) -> Result<(), NetError> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut swap_pending: Option<SwapInitiator> = None;
+    // One reader for the connection's whole lifetime: its buffer may hold a
+    // prefix of the next message, so the game loop shares it too.
+    let mut reader = MessageReader::new();
     loop {
         tokio::select! {
-            msg = read_idle(&mut stream) => match msg? {
+            msg = read_idle(&mut reader, &mut stream) => match msg? {
                 Message::SlotState { host_is_p1 } => {
                     // The client occupies the slot opposite the host.
                     let my_slot = if host_is_p1 { Player::Two } else { Player::One };
@@ -1071,7 +1080,9 @@ async fn guest_connection(
                         framebuffer: Arc::clone(&framebuffer),
                         ring: Arc::clone(&ring),
                     });
-                    match guest_game_loop(&mut stream, cmd_rx, &framebuffer, &ring).await? {
+                    match guest_game_loop(&mut reader, &mut stream, cmd_rx, &framebuffer, &ring)
+                        .await?
+                    {
                         GuestGameEnd::UiLeft => return Ok(()),
                         GuestGameEnd::HostEnded => {
                             // The host ended the game; return to the room loop on the same connection.
@@ -1131,6 +1142,7 @@ enum GuestGameEnd {
 /// Client game loop that decodes media into shared buffers and sends local input.
 /// Errors indicate host disconnection or a protocol failure.
 async fn guest_game_loop(
+    reader: &mut MessageReader,
     stream: &mut TcpStream,
     cmd_rx: &mut tokio_mpsc::UnboundedReceiver<RoomCmd>,
     framebuffer: &Arc<Mutex<Vec<u8>>>,
@@ -1140,7 +1152,7 @@ async fn guest_game_loop(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
-            msg = read_idle(stream) => match msg? {
+            msg = read_idle(reader, stream) => match msg? {
                 Message::Frame { keyframe, data, .. } => {
                     let fb = decoder.decode(keyframe, &data)?;
                     if let Ok(mut lock) = framebuffer.lock()

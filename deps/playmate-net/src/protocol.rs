@@ -189,13 +189,14 @@ impl Message {
     }
 
     /// Reads and decodes a complete message asynchronously.
+    ///
+    /// Not cancel-safe: partially read bytes live inside the returned future,
+    /// so dropping it mid-message desynchronizes the stream. Callers racing
+    /// reads inside `select!` must use [`MessageReader`] instead.
     pub async fn read_from(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Self> {
         let mut len_bytes = [0u8; 4];
         r.read_exact(&mut len_bytes).await?;
-        let len = u32::from_le_bytes(len_bytes);
-        if len == 0 || len > MAX_MESSAGE_LEN {
-            return Err(invalid(format!("非法消息长度: {len}")));
-        }
+        let len = validate_len(u32::from_le_bytes(len_bytes))?;
         let mut buf = vec![0u8; len as usize];
         r.read_exact(&mut buf).await?;
         Self::decode(&buf)
@@ -428,6 +429,65 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+/// Validates a frame length prefix against the protocol bounds.
+fn validate_len(len: u32) -> io::Result<u32> {
+    if len == 0 || len > MAX_MESSAGE_LEN {
+        return Err(invalid(format!("非法消息长度: {len}")));
+    }
+    Ok(len)
+}
+
+/// Cancel-safe message reader for `select!` loops.
+///
+/// [`Message::read_from`] keeps partially read bytes inside its future, so a
+/// `select!` branch dropping it mid-message loses those bytes and
+/// desynchronizes the stream. This reader keeps partial bytes in `self`
+/// instead: its only await point is a single `read_buf`, whose bytes land in
+/// the internal buffer atomically with future completion, so `next` may be
+/// dropped and re-invoked at any time without losing stream progress.
+///
+/// All reads on a connection must go through the same reader once one is used,
+/// because its buffer may hold a prefix of the next message.
+#[derive(Default)]
+pub struct MessageReader {
+    /// Received bytes not yet decoded; may end with a partial message.
+    buf: Vec<u8>,
+}
+
+impl MessageReader {
+    /// Creates a reader with an empty buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads the next complete message. Cancel-safe.
+    pub async fn next(&mut self, r: &mut (impl AsyncRead + Unpin)) -> io::Result<Message> {
+        loop {
+            if let Some(msg) = self.try_decode()? {
+                return Ok(msg);
+            }
+            if r.read_buf(&mut self.buf).await? == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "连接已关闭"));
+            }
+        }
+    }
+
+    /// Decodes one message when the buffer holds a complete frame.
+    fn try_decode(&mut self) -> io::Result<Option<Message>> {
+        let Some(len_bytes) = self.buf.first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let len = validate_len(u32::from_le_bytes(*len_bytes))? as usize;
+        let end = 4 + len;
+        if self.buf.len() < end {
+            return Ok(None);
+        }
+        let msg = Message::decode(&self.buf[4..end])?;
+        self.buf.drain(..end);
+        Ok(Some(msg))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -534,5 +594,98 @@ mod tests {
         // Zero length.
         let zero: &[u8] = &[0, 0, 0, 0];
         assert!(Message::read_from(&mut &*zero).await.is_err());
+    }
+
+    /// Test stream yielding one byte per poll and pending between bytes,
+    /// exposing the widest possible cancellation windows.
+    struct DribbleReader {
+        data: Vec<u8>,
+        pos: usize,
+        ready: bool,
+    }
+
+    impl AsyncRead for DribbleReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(Ok(())); // EOF
+            }
+            if !self.ready {
+                self.ready = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.ready = false;
+            let byte = self.data[self.pos];
+            buf.put_slice(&[byte]);
+            self.pos += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Polls a fresh `next` future exactly once and then drops it — the
+    /// harshest cancellation schedule a `select!` loop can produce.
+    async fn poll_next_once(
+        reader: &mut MessageReader,
+        stream: &mut DribbleReader,
+    ) -> Option<io::Result<Message>> {
+        let fut = reader.next(stream);
+        tokio::pin!(fut);
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => Some(result),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    /// The reader loses no bytes when its future is dropped between polls.
+    #[tokio::test]
+    async fn reader_survives_cancellation_between_polls() {
+        let messages = [
+            Message::SlotState { host_is_p1: true },
+            Message::AudioChunk { data: vec![7; 300] },
+            Message::Ping,
+        ];
+        let mut wire = Vec::new();
+        for message in &messages {
+            message.write_to(&mut wire).await.unwrap();
+        }
+        let mut stream = DribbleReader {
+            data: wire,
+            pos: 0,
+            ready: false,
+        };
+        let mut reader = MessageReader::new();
+        let mut decoded = Vec::new();
+        // Generous poll budget; a cancel-safety regression would exhaust it.
+        for _ in 0..100_000 {
+            if let Some(result) = poll_next_once(&mut reader, &mut stream).await {
+                decoded.push(result.unwrap());
+                if decoded.len() == messages.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(decoded, messages);
+    }
+
+    /// One reader decodes back-to-back messages without losing bytes between calls.
+    #[tokio::test]
+    async fn reader_decodes_back_to_back_messages() {
+        let mut wire = Vec::new();
+        Message::Ping.write_to(&mut wire).await.unwrap();
+        Message::Pong.write_to(&mut wire).await.unwrap();
+
+        let mut reader = MessageReader::new();
+        let mut stream: &[u8] = &wire;
+        assert_eq!(reader.next(&mut stream).await.unwrap(), Message::Ping);
+        assert_eq!(reader.next(&mut stream).await.unwrap(), Message::Pong);
+        // The stream is exhausted afterwards.
+        assert!(reader.next(&mut stream).await.is_err());
     }
 }
