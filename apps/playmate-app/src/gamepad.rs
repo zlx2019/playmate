@@ -3,6 +3,7 @@
 //! Mapping follows common emulator conventions using an Xbox-style layout:
 //! - D-pad / left stick -> NES/Famicom directions
 //! - South button (A) -> B, east button (B) -> A, preserving the console's B-left/A-right layout
+//! - West button (X) -> turbo B, north button (Y) -> turbo A, mirroring B/A one row up
 //! - Select/Back -> Select, Start/Menu -> Start
 //!
 //! Gamepads are assigned to P1 and P2 in first-input order and released on disconnect.
@@ -21,6 +22,8 @@ pub struct GamepadInput {
     slots: [Option<GamepadId>; 2],
     /// Gamepad button bitmap for each player.
     states: [ButtonState; 2],
+    /// Turbo-held bitmap for each player; the caller applies the fire cadence.
+    turbo: [ButtonState; 2],
 }
 
 impl GamepadInput {
@@ -37,6 +40,7 @@ impl GamepadInput {
             gilrs,
             slots: [None; 2],
             states: [ButtonState::empty(); 2],
+            turbo: [ButtonState::empty(); 2],
         }
     }
 
@@ -47,7 +51,13 @@ impl GamepadInput {
         };
         let mut changed = false;
         while let Some(event) = gilrs.next_event() {
-            changed |= Self::on_event(&mut self.slots, &mut self.states, gilrs, event);
+            changed |= Self::on_event(
+                &mut self.slots,
+                &mut self.states,
+                &mut self.turbo,
+                gilrs,
+                event,
+            );
         }
         changed
     }
@@ -55,6 +65,12 @@ impl GamepadInput {
     /// Returns the current gamepad bitmap for a player.
     pub fn state(&self, player: Player) -> ButtonState {
         self.states[Self::index(player)]
+    }
+
+    /// Returns the turbo-held bitmap for a player; buttons in it fire only
+    /// while the caller's turbo cadence is in its on phase.
+    pub fn turbo(&self, player: Player) -> ButtonState {
+        self.turbo[Self::index(player)]
     }
 
     /// Maps a player to its slot index.
@@ -84,15 +100,16 @@ impl GamepadInput {
     fn on_event(
         slots: &mut [Option<GamepadId>; 2],
         states: &mut [ButtonState; 2],
+        turbo: &mut [ButtonState; 2],
         gilrs: &Gilrs,
         event: Event,
     ) -> bool {
         match event.event {
             EventType::ButtonPressed(button, _) => {
-                Self::apply_button(slots, states, gilrs, event.id, button, true)
+                Self::apply_button(slots, states, turbo, gilrs, event.id, button, true)
             }
             EventType::ButtonReleased(button, _) => {
-                Self::apply_button(slots, states, gilrs, event.id, button, false)
+                Self::apply_button(slots, states, turbo, gilrs, event.id, button, false)
             }
             EventType::AxisChanged(axis, value, _) => {
                 Self::apply_axis(slots, states, gilrs, event.id, axis, value)
@@ -102,6 +119,7 @@ impl GamepadInput {
                 if let Some(i) = slots.iter().position(|s| *s == Some(event.id)) {
                     slots[i] = None;
                     states[i] = ButtonState::empty();
+                    turbo[i] = ButtonState::empty();
                     log::info!("P{} gamepad disconnected", i + 1);
                     return true;
                 }
@@ -115,26 +133,33 @@ impl GamepadInput {
     fn apply_button(
         slots: &mut [Option<GamepadId>; 2],
         states: &mut [ButtonState; 2],
+        turbo: &mut [ButtonState; 2],
         gilrs: &Gilrs,
         id: GamepadId,
         button: PadButton,
         pressed: bool,
     ) -> bool {
-        let target = match button {
-            PadButton::South => Button::B,
-            PadButton::East => Button::A,
-            PadButton::DPadUp => Button::Up,
-            PadButton::DPadDown => Button::Down,
-            PadButton::DPadLeft => Button::Left,
-            PadButton::DPadRight => Button::Right,
-            PadButton::Select => Button::Select,
-            PadButton::Start => Button::Start,
+        let (target, is_turbo) = match button {
+            PadButton::South => (Button::B, false),
+            PadButton::East => (Button::A, false),
+            PadButton::West => (Button::B, true),
+            PadButton::North => (Button::A, true),
+            PadButton::DPadUp => (Button::Up, false),
+            PadButton::DPadDown => (Button::Down, false),
+            PadButton::DPadLeft => (Button::Left, false),
+            PadButton::DPadRight => (Button::Right, false),
+            PadButton::Select => (Button::Select, false),
+            PadButton::Start => (Button::Start, false),
             _ => return false,
         };
         let Some(i) = Self::slot_of(slots, gilrs, id) else {
             return false;
         };
-        states[i].set(target, pressed);
+        if is_turbo {
+            turbo[i].set(target, pressed);
+        } else {
+            states[i].set(target, pressed);
+        }
         true
     }
 

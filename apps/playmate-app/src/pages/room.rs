@@ -48,6 +48,8 @@ pub struct RoomState {
     /// Informational status message, kept separate from `error` so routine
     /// notices (declines, role changes) never render as failures.
     pub notice: Option<String>,
+    /// Latest round-trip latency to the host in milliseconds (guest side only).
+    pub latency_ms: Option<u32>,
     /// Waiting for the peer to answer the local swap request.
     pub swap_outgoing: bool,
     /// Auto-decline deadline of the peer's pending swap request.
@@ -93,6 +95,21 @@ pub struct RoomUpdates {
     /// The local role changed (`true` = now spectator); the application keeps
     /// its quick-rejoin entry in sync with it.
     pub role_changed: Option<bool>,
+}
+
+/// Colored latency text shared by the room page and the guest game header:
+/// green under 60 ms, yellow under 120 ms, red beyond.
+pub fn latency_text(ms: u32) -> egui::RichText {
+    let color = if ms < 60 {
+        theme::GREEN
+    } else if ms < 120 {
+        egui::Color32::from_rgb(222, 178, 88)
+    } else {
+        theme::RED_BRIGHT
+    };
+    egui::RichText::new(format!("延迟 {ms} ms"))
+        .size(12.0)
+        .color(color)
 }
 
 /// Applies network events to room state and returns application-level signals.
@@ -170,8 +187,11 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 });
             }
             RoomEvent::GameEnded => updates.game_ended = true,
+            RoomEvent::Latency { rtt_ms } => state.latency_ms = Some(rtt_ms),
             RoomEvent::Reconnecting { attempt } => {
                 state.error = Some(format!("连接中断，正在自动重连…（第 {attempt} 次）"));
+                // The link is down; the last measurement no longer applies.
+                state.latency_ms = None;
                 state.swap_outgoing = false;
                 state.swap_incoming = None;
                 state.seat_outgoing = false;
@@ -233,6 +253,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
         }
         if let Some(notice) = &state.notice {
             ui.label(egui::RichText::new(notice).color(theme::GREEN));
+            ui.add_space(6.0);
+        }
+        // Guest side: connection quality to the host at a glance.
+        if let Some(ms) = state.latency_ms {
+            ui.label(latency_text(ms));
             ui.add_space(6.0);
         }
 

@@ -97,6 +97,11 @@ pub enum RoomEvent {
     },
     /// Automatic reconnection succeeded; `GameStarted` follows if a game is still active.
     Reconnected,
+    /// Round trip to the host measured by the heartbeat (guest side).
+    Latency {
+        /// Milliseconds between sending `Ping` and receiving `Pong`.
+        rtt_ms: u32,
+    },
     /// The peer asked for a slot swap and awaits the local user's answer.
     SwapRequested,
     /// The peer declined the local user's swap request.
@@ -1077,6 +1082,8 @@ async fn guest_connection(
     // prefix of the next message, so the game loop shares it too.
     let mut reader = MessageReader::new();
     let mut last_recv = Instant::now();
+    // Send time of the last heartbeat Ping, for round-trip measurement.
+    let mut ping_sent: Option<Instant> = None;
     loop {
         tokio::select! {
             msg = read_alive(&mut reader, &mut stream, &mut last_recv) => match msg? {
@@ -1154,6 +1161,14 @@ async fn guest_connection(
                     }
                 }
                 Message::Ping => Message::Pong.write_to(&mut stream).await?,
+                Message::Pong => {
+                    // Answer to our own heartbeat: surface the round trip.
+                    if let Some(sent) = ping_sent.take() {
+                        let _ = event_tx.send(RoomEvent::Latency {
+                            rtt_ms: u32::try_from(sent.elapsed().as_millis()).unwrap_or(u32::MAX),
+                        });
+                    }
+                }
                 other => log::debug!("room loop ignored message: {other:?}"),
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -1194,6 +1209,7 @@ async fn guest_connection(
                 if last_recv.elapsed() >= IDLE_TIMEOUT {
                     return Err(idle_timeout_error());
                 }
+                ping_sent = Some(Instant::now());
                 Message::Ping.write_to(&mut stream).await?;
             }
         }
@@ -1221,6 +1237,8 @@ async fn guest_game_loop(
     let mut decoder = FrameDecoder::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut last_recv = Instant::now();
+    // Send time of the last heartbeat Ping, for round-trip measurement.
+    let mut ping_sent: Option<Instant> = None;
     loop {
         tokio::select! {
             msg = read_alive(reader, stream, &mut last_recv) => match msg? {
@@ -1242,6 +1260,14 @@ async fn guest_game_loop(
                 }
                 Message::GameEnd => return Ok(GuestGameEnd::HostEnded),
                 Message::Ping => Message::Pong.write_to(stream).await?,
+                Message::Pong => {
+                    // Answer to our own heartbeat: surface the round trip.
+                    if let Some(sent) = ping_sent.take() {
+                        let _ = event_tx.send(RoomEvent::Latency {
+                            rtt_ms: u32::try_from(sent.elapsed().as_millis()).unwrap_or(u32::MAX),
+                        });
+                    }
+                }
                 other => log::debug!("game loop ignored message: {other:?}"),
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -1257,6 +1283,7 @@ async fn guest_game_loop(
                 if last_recv.elapsed() >= IDLE_TIMEOUT {
                     return Err(idle_timeout_error());
                 }
+                ping_sent = Some(Instant::now());
                 Message::Ping.write_to(stream).await?;
             }
         }

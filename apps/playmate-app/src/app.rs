@@ -34,6 +34,9 @@ use crate::play::{GuestPlay, PlaySession};
 // Matches theme background #141417 after converting sRGB to wgpu's linear color space.
 const CLEAR_COLOR: [f32; 4] = [0.007, 0.007, 0.0085, 1.0];
 
+/// Fast-forward speed multiplier while the hold key (Tab) is down.
+const FF_SPEED: u8 = 4;
+
 /// Current page, with each variant carrying its private state.
 pub enum Page {
     /// Main menu.
@@ -229,6 +232,12 @@ impl PlaymateApp {
                             open_menu = true;
                         }
                         ui.label(egui::RichText::new(&session.rom_title).strong());
+                        if session.is_fast_forward() {
+                            ui.label(
+                                egui::RichText::new("▶▶ 4×")
+                                    .color(egui::Color32::from_rgb(222, 178, 88)),
+                            );
+                        }
                         if let Some(net_state) = net {
                             match &net_state.error {
                                 Some(err) => {
@@ -253,9 +262,23 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
-                    match game_menu::show(ui, &self.cfg, menu, net.is_none()) {
+                    match game_menu::show(ui, &self.cfg, menu, net.is_none(), true) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
+                            menu.open = false;
+                            menu.settings = None;
+                            session.set_paused(false);
+                        }
+                        // Save/load close the menu so the result toast and the
+                        // (possibly restored) frame are immediately visible.
+                        GameMenuAction::SaveState => {
+                            session.request_save_state();
+                            menu.open = false;
+                            menu.settings = None;
+                            session.set_paused(false);
+                        }
+                        GameMenuAction::LoadState => {
+                            session.request_load_state();
                             menu.open = false;
                             menu.settings = None;
                             session.set_paused(false);
@@ -310,6 +333,9 @@ impl PlaymateApp {
                                     egui::RichText::new(status)
                                         .color(egui::Color32::from_rgb(110, 200, 110)),
                                 );
+                                if let Some(ms) = net.latency_ms {
+                                    ui.label(room::latency_text(ms));
+                                }
                             }
                         }
                     });
@@ -322,12 +348,14 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(ui, &self.cfg, menu, false) {
+                    match game_menu::show(ui, &self.cfg, menu, false, false) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
                         }
+                        // Guests never see save/load; the emulator is not local.
+                        GameMenuAction::SaveState | GameMenuAction::LoadState => {}
                         GameMenuAction::Exit => leave = true,
                         GameMenuAction::RestoreDefaults => restore_default_keys(
                             &mut self.cfg,
@@ -487,6 +515,7 @@ impl PlaymateApp {
                         selected: None,
                         error: None,
                         notice: None,
+                        latency_ms: None,
                         swap_outgoing: false,
                         swap_incoming: None,
                         is_spectator: role == JoinRole::Spectator,
@@ -582,6 +611,7 @@ impl PlaymateApp {
                 selected: None,
                 error: None,
                 notice: None,
+                latency_ms: None,
                 swap_outgoing: false,
                 swap_incoming: None,
                 is_spectator: false,
@@ -607,8 +637,7 @@ impl PlaymateApp {
     /// Captures a physical key for the pending setting and saves it immediately.
     /// Returns whether the keyboard event was consumed.
     fn handle_rebind_capture(&mut self, code: KeyCode) -> bool {
-        let Some((player, button)) = self.settings_state_mut().and_then(|s| s.capturing.take())
-        else {
+        let Some((player, key)) = self.settings_state_mut().and_then(|s| s.capturing.take()) else {
             return false;
         };
         if code == KeyCode::Escape {
@@ -617,7 +646,7 @@ impl PlaymateApp {
             }
             return true;
         }
-        config::bind_key(&mut self.cfg, player, button, code);
+        config::bind_key(&mut self.cfg, player, key, code);
         self.input_map = InputMap::from_config(&self.cfg);
         let hint = match config::save(&mut self.cfg) {
             Ok(()) => format!("已保存：{}", settings::key_label(Some(code))),
@@ -637,6 +666,9 @@ impl PlaymateApp {
                 menu.open = !menu.open;
                 if menu.open {
                     session.clear_input();
+                    // The menu swallows the Tab release, so drop fast-forward
+                    // now or it would stay engaged after resuming.
+                    session.set_speed(1);
                 } else {
                     menu.settings = None;
                 }
@@ -771,12 +803,31 @@ impl ApplicationHandler for PlaymateApp {
                 }
             } else {
                 match &mut self.page {
-                    Page::Playing { session, .. } => {
+                    Page::Playing { session, net, .. } => {
                         if code == KeyCode::Escape {
                             toggle_menu = toggle;
                             consumed_by_game = true;
+                        } else if code == KeyCode::F5 {
+                            // Instant save/load hotkeys, host-side only.
+                            if toggle {
+                                session.request_save_state();
+                            }
+                            consumed_by_game = true;
+                        } else if code == KeyCode::F9 {
+                            if toggle {
+                                session.request_load_state();
+                            }
+                            consumed_by_game = true;
                         } else {
                             consumed_by_game = session.on_key(&self.input_map, code, pressed);
+                            // Unbound Tab is the fast-forward hold; netplay
+                            // cannot speed up because peers stream in real time.
+                            if !consumed_by_game && code == KeyCode::Tab {
+                                if net.is_none() {
+                                    session.set_speed(if pressed { FF_SPEED } else { 1 });
+                                }
+                                consumed_by_game = true;
+                            }
                         }
                     }
                     Page::GuestPlaying { play, .. } => {
@@ -785,6 +836,10 @@ impl ApplicationHandler for PlaymateApp {
                             consumed_by_game = true;
                         } else {
                             consumed_by_game = play.on_key(&self.input_map, code, pressed);
+                            // Swallow unbound Tab so it does not cycle egui focus mid-game.
+                            if !consumed_by_game && code == KeyCode::Tab {
+                                consumed_by_game = true;
+                            }
                         }
                     }
                     Page::Settings { .. } if pressed => {

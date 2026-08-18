@@ -7,15 +7,29 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use playmate_core::{ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, TetanesCore};
 use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
-use crate::config::InputMap;
+use crate::config::{self, InputMap};
 use crate::emu::{self, NetSink, SharedState};
 use crate::gamepad::GamepadInput;
+
+/// How long a save/load result toast stays on screen.
+const TOAST_DURATION: Duration = Duration::from_millis(2500);
+
+/// Turbo cadence half-period: 33 ms pressed, 33 ms released, roughly 15
+/// presses per second, which registers reliably with games polling input
+/// once per frame.
+const TURBO_HALF_PERIOD_MS: u128 = 33;
+
+/// Whether turbo-held buttons fire at this instant of the session clock.
+fn turbo_fire_on(since: Instant) -> bool {
+    (since.elapsed().as_millis() / TURBO_HALF_PERIOD_MS).is_multiple_of(2)
+}
 
 /// A running game session.
 pub struct PlaySession {
@@ -33,9 +47,15 @@ pub struct PlaySession {
     texture: Option<egui::TextureHandle>,
     /// Per-player keyboard bitmaps, maintained separately from gamepad input.
     keyboard: [ButtonState; 2],
+    /// Per-player keyboard turbo-held bitmaps, fired on the turbo cadence.
+    turbo: [ButtonState; 2],
+    /// Session clock driving the turbo cadence.
+    started: Instant,
     /// Local player's slot in netplay. When set, local input writes only this
     /// slot and the network task writes the remote slot. `None` means local play.
     net_local_slot: Option<Player>,
+    /// Active save/load result toast with its display start time.
+    toast: Option<(String, Instant)>,
 }
 
 impl PlaySession {
@@ -62,7 +82,10 @@ impl PlaySession {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| rom_path.display().to_string());
 
-        let mut core = TetanesCore::new();
+        // Battery saves live in the saves directory; loading the ROM restores
+        // its .sram file automatically when one exists.
+        let saves_dir = config::saves_dir();
+        let mut core = TetanesCore::with_sram_dir(Some(saves_dir.clone()));
         core.load_rom(&rom_title, &rom_bytes)
             .with_context(|| format!("加载 ROM 失败: {rom_title}"))?;
 
@@ -74,10 +97,12 @@ impl PlaySession {
             Some((slot, sink)) => (Some(slot), Some(sink)),
             None => (None, None),
         };
+        let state_path = saves_dir.join(format!("{rom_title}.state"));
         let shared = Arc::new(SharedState::new());
         let emu_shared = Arc::clone(&shared);
-        let emu_handle =
-            std::thread::spawn(move || emu::run_emulation(core, emu_shared, ring, net_sink));
+        let emu_handle = std::thread::spawn(move || {
+            emu::run_emulation(core, emu_shared, ring, net_sink, Some(state_path));
+        });
 
         log::info!("game started: {rom_title}");
         Ok(Self {
@@ -88,7 +113,10 @@ impl PlaySession {
             _audio_stream: audio_stream,
             texture: None,
             keyboard: [ButtonState::empty(); 2],
+            turbo: [ButtonState::empty(); 2],
+            started: Instant::now(),
             net_local_slot,
+            toast: None,
         })
     }
 
@@ -111,32 +139,44 @@ impl PlaySession {
     /// both P1 and P2 key layouts map to the local slot. Pressing the same logical
     /// button through both layouts and releasing one early is a minor edge case.
     pub fn on_key(&mut self, input_map: &InputMap, code: KeyCode, pressed: bool) -> bool {
-        let Some((player, button)) = input_map.lookup(code) else {
+        let Some((player, key)) = input_map.lookup(code) else {
             return false;
         };
-        let slot = self.net_local_slot.unwrap_or(player);
-        self.keyboard[Self::index(slot)].set(button, pressed);
+        let slot = Self::index(self.net_local_slot.unwrap_or(player));
+        if key.is_turbo() {
+            self.turbo[slot].set(key.button(), pressed);
+        } else {
+            self.keyboard[slot].set(key.button(), pressed);
+        }
         true
     }
 
-    /// Merges keyboard and gamepad bitmaps and publishes them once per frame.
+    /// Merges keyboard and gamepad bitmaps and publishes them once per frame,
+    /// overlaying turbo-held buttons during the on phase of the turbo cadence.
     /// Local play controls both slots; netplay writes only the local slot.
     /// `blocked` publishes released buttons instead, used while the in-game
     /// menu is open; a remote player's slot is never touched.
     pub fn sync_input(&self, gamepad: &GamepadInput, blocked: bool) {
+        let fire = turbo_fire_on(self.started);
         match self.net_local_slot {
             None => {
                 for player in [Player::One, Player::Two] {
-                    let merged =
-                        self.keyboard[Self::index(player)].bits() | gamepad.state(player).bits();
+                    let i = Self::index(player);
+                    let mut merged = self.keyboard[i].bits() | gamepad.state(player).bits();
+                    if fire {
+                        merged |= self.turbo[i].bits() | gamepad.turbo(player).bits();
+                    }
                     let value = if blocked { 0 } else { merged };
                     self.buttons_cell(player).store(value, Ordering::Relaxed);
                 }
             }
             Some(local) => {
                 // In netplay, the first local gamepad controls the local slot.
-                let merged =
-                    self.keyboard[Self::index(local)].bits() | gamepad.state(Player::One).bits();
+                let i = Self::index(local);
+                let mut merged = self.keyboard[i].bits() | gamepad.state(Player::One).bits();
+                if fire {
+                    merged |= self.turbo[i].bits() | gamepad.turbo(Player::One).bits();
+                }
                 let value = if blocked { 0 } else { merged };
                 self.buttons_cell(local).store(value, Ordering::Relaxed);
             }
@@ -147,12 +187,35 @@ impl PlaySession {
     /// opens so keys held at that moment do not stay latched.
     pub fn clear_input(&mut self) {
         self.keyboard = [ButtonState::empty(); 2];
+        self.turbo = [ButtonState::empty(); 2];
     }
 
     /// Pauses or resumes the emulation thread. Only local play pauses; a
     /// netplay host keeps running because peers cannot be paused.
     pub fn set_paused(&self, paused: bool) {
         self.shared.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Sets the emulation speed multiplier; 1 restores normal speed.
+    pub fn set_speed(&self, multiplier: u8) {
+        self.shared
+            .speed
+            .store(multiplier.max(1), Ordering::Relaxed);
+    }
+
+    /// Whether fast-forward is currently engaged.
+    pub fn is_fast_forward(&self) -> bool {
+        self.shared.speed.load(Ordering::Relaxed) > 1
+    }
+
+    /// Requests an instant state save, served by the emulation thread.
+    pub fn request_save_state(&self) {
+        self.shared.save_state_req.store(true, Ordering::Relaxed);
+    }
+
+    /// Requests restoring the instant save state, served by the emulation thread.
+    pub fn request_load_state(&self) {
+        self.shared.load_state_req.store(true, Ordering::Relaxed);
     }
 
     /// Returns the shared input cell for a player slot.
@@ -163,12 +226,41 @@ impl PlaySession {
         }
     }
 
-    /// Draws the game frame.
+    /// Draws the game frame and any transient save/load result toast.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let Ok(fb) = self.shared.framebuffer.lock() else {
+        if let Ok(fb) = self.shared.framebuffer.lock() {
+            render_frame_texture(ui, &mut self.texture, &fb);
+        }
+        self.show_toast(ui.ctx());
+    }
+
+    /// Picks up the latest emulation status message and draws it above the
+    /// frame for a short time.
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        if let Ok(mut status) = self.shared.status.lock()
+            && let Some(msg) = status.take()
+        {
+            self.toast = Some((msg, Instant::now()));
+        }
+        let Some((msg, since)) = &self.toast else {
             return;
         };
-        render_frame_texture(ui, &mut self.texture, &fb);
+        if since.elapsed() >= TOAST_DURATION {
+            self.toast = None;
+            return;
+        }
+        egui::Area::new(egui::Id::new("emu-status-toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -48.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(msg).strong());
+                });
+            });
+        // Keep repainting while the toast is visible so it expires even when
+        // the game is paused and nothing else triggers a redraw.
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
@@ -215,6 +307,10 @@ pub struct GuestPlay {
     texture: Option<egui::TextureHandle>,
     /// Local keyboard bitmap; both configured layouts map to the local character.
     keyboard: ButtonState,
+    /// Keyboard turbo-held bitmap, fired on the turbo cadence.
+    turbo: ButtonState,
+    /// Session clock driving the turbo cadence.
+    started: Instant,
     /// Last merged bitmap sent, used to avoid sending unchanged input every frame.
     last_sent: u8,
     /// Spectators watch the stream and never produce input.
@@ -245,6 +341,8 @@ impl GuestPlay {
             _audio_stream: audio_stream,
             texture: None,
             keyboard: ButtonState::empty(),
+            turbo: ButtonState::empty(),
+            started: Instant::now(),
             last_sent: 0,
             spectator,
         })
@@ -261,10 +359,14 @@ impl GuestPlay {
         if self.spectator {
             return false;
         }
-        let Some((_player, button)) = input_map.lookup(code) else {
+        let Some((_player, key)) = input_map.lookup(code) else {
             return false;
         };
-        self.keyboard.set(button, pressed);
+        if key.is_turbo() {
+            self.turbo.set(key.button(), pressed);
+        } else {
+            self.keyboard.set(key.button(), pressed);
+        }
         true
     }
 
@@ -272,9 +374,11 @@ impl GuestPlay {
     /// opens so keys held at that moment do not stay latched.
     pub fn clear_input(&mut self) {
         self.keyboard = ButtonState::empty();
+        self.turbo = ButtonState::empty();
     }
 
-    /// Merges keyboard and gamepad input, returning changes for the network task.
+    /// Merges keyboard and gamepad input, overlaying turbo-held buttons on the
+    /// turbo cadence, and returns changes for the network task.
     /// Spectators never produce outgoing input. `blocked` reports released
     /// buttons instead, used while the in-game menu is open.
     pub fn poll_outgoing(&mut self, gamepad: &GamepadInput, blocked: bool) -> Option<u8> {
@@ -284,7 +388,11 @@ impl GuestPlay {
         let merged = if blocked {
             0
         } else {
-            self.keyboard.bits() | gamepad.state(Player::One).bits()
+            let mut bits = self.keyboard.bits() | gamepad.state(Player::One).bits();
+            if turbo_fire_on(self.started) {
+                bits |= self.turbo.bits() | gamepad.turbo(Player::One).bits();
+            }
+            bits
         };
         if merged != self.last_sent {
             self.last_sent = merged;

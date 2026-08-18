@@ -3,10 +3,11 @@
 //! [tetanes-core]: https://crates.io/crates/tetanes-core
 
 use std::io::Cursor;
+use std::path::PathBuf;
 
 use tetanes_core::{
     common::ResetKind,
-    control_deck::ControlDeck,
+    control_deck::{Clocked, Config, ControlDeck},
     input::{JoypadBtn, Player as TetanesPlayer},
 };
 
@@ -19,10 +20,22 @@ pub struct TetanesCore {
 }
 
 impl TetanesCore {
-    /// Creates a core with the default configuration.
+    /// Creates a core with battery saves disabled; the deck performs no
+    /// filesystem access of its own. Suitable for tests and headless use.
     pub fn new() -> Self {
+        Self::with_sram_dir(None)
+    }
+
+    /// Creates a core that keeps battery-backed SRAM files under `sram_dir`.
+    /// Loading a ROM restores its `.sram` file automatically when present;
+    /// writing back happens through [`NesCore::persist_sram`].
+    pub fn with_sram_dir(sram_dir: Option<PathBuf>) -> Self {
+        let cfg = Config {
+            sram_dir,
+            ..Config::default()
+        };
         Self {
-            deck: ControlDeck::new(),
+            deck: ControlDeck::with_config(cfg),
         }
     }
 
@@ -71,10 +84,16 @@ impl NesCore for TetanesCore {
     }
 
     fn clock_frame(&mut self) -> Result<(), CoreError> {
-        self.deck
-            .clock_frame()
-            .map(|_| ())
-            .map_err(|e| CoreError::Clock(e.to_string()))
+        // At speeds above 1x the deck owes several NES frames per display
+        // frame and hands them out one call at a time; drain them here so one
+        // call always advances one full display frame.
+        loop {
+            match self.deck.clock_frame() {
+                Ok(Clocked::Continue) => {}
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(CoreError::Clock(e.to_string())),
+            }
+        }
     }
 
     fn set_player_input(&mut self, player: Player, state: ButtonState) {
@@ -101,8 +120,44 @@ impl NesCore for TetanesCore {
         self.deck.set_sample_rate(rate);
     }
 
+    fn set_frame_speed(&mut self, speed: f32) {
+        self.deck.set_frame_speed(speed);
+    }
+
     fn reset(&mut self) {
         self.deck.reset(ResetKind::Soft);
+    }
+
+    fn battery_backed(&self) -> bool {
+        self.deck.cart_battery_backed().unwrap_or(false)
+    }
+
+    fn persist_sram(&mut self) -> Result<(), CoreError> {
+        // save_sram_path is already a no-op without a battery; resolving the
+        // path first also makes a disabled sram_dir a clean no-op.
+        let Some(name) = self.deck.loaded_rom().map(|rom| rom.name.clone()) else {
+            return Ok(());
+        };
+        let Some(path) = self.deck.sram_path(&name) else {
+            return Ok(());
+        };
+        self.deck
+            .save_sram_path(path)
+            .map_err(|e| CoreError::Sram(e.to_string()))
+    }
+
+    fn save_state(&mut self) -> Result<Vec<u8>, CoreError> {
+        let mut buf = Vec::new();
+        self.deck
+            .save_state(&mut buf)
+            .map_err(|e| CoreError::State(e.to_string()))?;
+        Ok(buf)
+    }
+
+    fn load_state(&mut self, data: &[u8]) -> Result<(), CoreError> {
+        self.deck
+            .load_state(&mut Cursor::new(data))
+            .map_err(|e| CoreError::State(e.to_string()))
     }
 }
 
@@ -178,6 +233,37 @@ mod tests {
                 .joypad(TetanesPlayer::Two)
                 .button(JoypadBtn::Left.into())
         );
+    }
+
+    /// An instant state saved mid-game restores after further emulation,
+    /// and corrupted state data is rejected without touching the console.
+    #[test]
+    fn save_and_load_state_roundtrip() {
+        let mut core = TetanesCore::new();
+        core.load_rom("synthetic", &synthetic_rom()).unwrap();
+        for _ in 0..2 {
+            core.clock_frame().unwrap();
+        }
+
+        let state = core.save_state().unwrap();
+        assert!(!state.is_empty());
+        for _ in 0..3 {
+            core.clock_frame().unwrap();
+        }
+        core.load_state(&state).unwrap();
+        // The restored console keeps running.
+        core.clock_frame().unwrap();
+
+        assert!(core.load_state(&[0u8; 16]).is_err());
+    }
+
+    /// The synthetic ROM has no battery, so SRAM persistence is a no-op.
+    #[test]
+    fn sram_noop_without_battery() {
+        let mut core = TetanesCore::new();
+        core.load_rom("synthetic", &synthetic_rom()).unwrap();
+        assert!(!core.battery_backed());
+        core.persist_sram().unwrap();
     }
 
     /// Smoke test: load a synthetic ROM, apply input, advance frames, and validate output.
