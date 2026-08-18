@@ -282,6 +282,17 @@ impl PlaySession {
         self.shared.ntsc_filter.store(enabled, Ordering::Relaxed);
     }
 
+    /// Engages or releases hold-to-rewind; the emulation thread rolls back
+    /// through recent snapshots while set. Local play only.
+    pub fn set_rewinding(&self, on: bool) {
+        self.shared.rewinding.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether rewind is currently engaged.
+    pub fn is_rewinding(&self) -> bool {
+        self.shared.rewinding.load(Ordering::Relaxed)
+    }
+
     /// Requests an instant state save into a one-based slot,
     /// served by the emulation thread.
     pub fn request_save_state(&self, slot: u8) {
