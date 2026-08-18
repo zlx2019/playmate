@@ -8,7 +8,7 @@
 mod tetanes_impl;
 mod types;
 
-pub use tetanes_impl::TetanesCore;
+pub use tetanes_impl::{TetanesCore, validate_genie_code};
 pub use types::{Button, ButtonState, FRAME_BYTES, NTSC_FPS, Player, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// Common error type for the emulation core.
@@ -26,6 +26,9 @@ pub enum CoreError {
     /// Saving or restoring an instant state failed.
     #[error("即时存档操作失败: {0}")]
     State(String),
+    /// A Game Genie cheat code was rejected.
+    #[error("金手指码无效: {0}")]
+    Genie(String),
 }
 
 /// Common interface for an NES emulation core.
@@ -64,6 +67,11 @@ pub trait NesCore {
     /// stays constant while sounding sped up.
     fn set_frame_speed(&mut self, speed: f32);
 
+    /// Switches between the NTSC composite filter (CRT-like softening, the
+    /// hardware-faithful default) and raw per-pixel palette output.
+    /// The frame buffer size is unaffected.
+    fn set_ntsc_filter(&mut self, enabled: bool);
+
     /// Performs a soft reset, equivalent to pressing Reset on the console.
     fn reset(&mut self);
 
@@ -82,4 +90,10 @@ pub trait NesCore {
     /// Restores a state previously produced by
     /// [`save_state`](NesCore::save_state) for the same ROM.
     fn load_state(&mut self, data: &[u8]) -> Result<(), CoreError>;
+
+    /// Applies a Game Genie cheat code to the running console.
+    fn add_genie_code(&mut self, code: &str) -> Result<(), CoreError>;
+
+    /// Removes a previously applied Game Genie code; unknown codes are ignored.
+    fn remove_genie_code(&mut self, code: &str);
 }

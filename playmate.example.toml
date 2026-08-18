@@ -18,7 +18,7 @@
 # - turbo_a / turbo_b 为连发键：按住时对应按键约每秒自动连点 15 次。
 # - 手柄即插即用无需配置：按先后顺序分配给 P1、P2；
 #   十字键/左摇杆=方向，南键(A)=B、东键(B)=A，西键(X)=连发B、北键(Y)=连发A，
-#   Back=Select，Menu=Start。
+#   Back=Select，Menu=Start，Mode(Xbox 徽标/PS 键)=呼出暂停菜单。
 
 [keys.p1]
 up = "KeyW"
@@ -44,3 +44,13 @@ turbo_b = "Numpad1"
 turbo_a = "Numpad2"
 # P2 默认不绑定 select（真机 2P 手柄没有 Select 键），需要时取消注释：
 # select = "NumpadSubtract"
+
+# 画面（设置页可视化管理）：
+# [video]
+# ntsc_filter = true    # NTSC 柔化滤镜（CRT 观感，默认开）；false = 锐利点阵
+
+# 金手指（Game Genie 码，按游戏名分组；游戏内暂停菜单可视化管理）：
+# 码为 6 或 8 位字母，与 ROM 版本（美版/日版）相关。
+# [[cheats."Super Mario Bros"]]
+# code = "SXIOPO"     # 无限命
+# enabled = true

@@ -23,6 +23,31 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 /// crash; a final write also happens when the session ends.
 const SRAM_AUTOSAVE: Duration = Duration::from_secs(60);
 
+/// Number of manual instant-state slots per game.
+pub const STATE_SLOTS: usize = 3;
+
+/// Save-state thumbnail width: half the NES frame, nearest-sampled.
+pub const THUMB_WIDTH: usize = 128;
+
+/// Save-state thumbnail height: half the NES frame, nearest-sampled.
+pub const THUMB_HEIGHT: usize = 120;
+
+/// Instant-state file locations for one game.
+pub struct StatePaths {
+    /// Manual slot files; index 0 is slot 1, the F5/F9 quick slot.
+    pub slots: [PathBuf; STATE_SLOTS],
+    /// Auto snapshot written when the session ends, enabling quick resume.
+    pub auto: PathBuf,
+}
+
+/// Cheat mutation requested by the UI and served by the emulation thread.
+pub enum CheatCmd {
+    /// Apply a Game Genie code, already validated by the UI.
+    Add(String),
+    /// Remove an applied Game Genie code.
+    Remove(String),
+}
+
 /// Media output channels from emulation to the network sender in host mode.
 pub struct NetSink {
     /// Raw RGBA frames; the small bounded queue may drop frames rather than block emulation.
@@ -43,12 +68,16 @@ pub struct SharedState {
     pub paused: AtomicBool,
     /// Emulation speed multiplier; 1 is normal, larger values fast-forward.
     pub speed: AtomicU8,
-    /// One-shot request to write an instant save state.
-    pub save_state_req: AtomicBool,
-    /// One-shot request to restore the instant save state.
-    pub load_state_req: AtomicBool,
+    /// Whether the NTSC composite filter is active (the tetanes default).
+    pub ntsc_filter: AtomicBool,
+    /// One-shot request to write an instant save state; 0 = none, else the slot number.
+    pub save_state_req: AtomicU8,
+    /// One-shot request to restore an instant save state; 0 = none, else the slot number.
+    pub load_state_req: AtomicU8,
     /// Latest save/load result message, taken by the UI for a transient toast.
     pub status: Mutex<Option<String>>,
+    /// Pending cheat mutations, drained by the emulation thread.
+    pub cheat_cmds: Mutex<Vec<CheatCmd>>,
     /// Latest RGBA8 frame, always [`FRAME_BYTES`] bytes.
     pub framebuffer: Mutex<Vec<u8>>,
 }
@@ -62,9 +91,11 @@ impl SharedState {
             running: AtomicBool::new(true),
             paused: AtomicBool::new(false),
             speed: AtomicU8::new(1),
-            save_state_req: AtomicBool::new(false),
-            load_state_req: AtomicBool::new(false),
+            ntsc_filter: AtomicBool::new(true),
+            save_state_req: AtomicU8::new(0),
+            load_state_req: AtomicU8::new(0),
             status: Mutex::new(None),
+            cheat_cmds: Mutex::new(Vec::new()),
             framebuffer: Mutex::new(vec![0u8; FRAME_BYTES]),
         }
     }
@@ -79,17 +110,20 @@ pub fn run_emulation(
     shared: Arc<SharedState>,
     ring: Arc<AudioRing>,
     net: Option<NetSink>,
-    state_path: Option<PathBuf>,
+    paths: Option<StatePaths>,
 ) {
     let frame_dur = Duration::from_secs_f64(1.0 / NTSC_FPS);
     let mut next = Instant::now() + frame_dur;
     let mut last_sram_save = Instant::now();
     let mut current_speed: u8 = 1;
+    // Matches both the deck's and SharedState's initial filter.
+    let mut current_ntsc = true;
 
     while shared.running.load(Ordering::Relaxed) {
-        // 0. Serve instant save/load requests before the pause check, so the
-        // pause-menu actions work while local play is paused.
-        handle_state_requests(&mut core, &shared, state_path.as_deref());
+        // 0. Serve instant save/load and cheat requests before the pause
+        // check, so the pause-menu actions work while local play is paused.
+        handle_state_requests(&mut core, &shared, paths.as_ref());
+        handle_cheat_cmds(&mut core, &shared);
 
         // 1. Paused (local play): idle without stepping and hold the frame
         // clock so resuming does not fast-forward the missed frames.
@@ -106,6 +140,13 @@ pub fn run_emulation(
         if speed != current_speed {
             current_speed = speed;
             core.set_frame_speed(f32::from(speed));
+        }
+
+        // 1.6 Video filter switches apply between frames.
+        let ntsc = shared.ntsc_filter.load(Ordering::Relaxed);
+        if ntsc != current_ntsc {
+            current_ntsc = ntsc;
+            core.set_ntsc_filter(ntsc);
         }
 
         // 2. Replace both players' input with the latest state.
@@ -159,40 +200,82 @@ pub fn run_emulation(
     if let Err(e) = core.persist_sram() {
         log::error!("failed to save battery SRAM on exit: {e}");
     }
+    // Auto-resume snapshot, loaded by the main menu's continue entry.
+    if let Some(paths) = &paths
+        && let Err(e) = save_state_file(&mut core, &paths.auto)
+    {
+        log::warn!("failed to write auto-resume state: {e}");
+    }
     log::info!("emulation thread exited");
 }
 
 /// Serves one-shot instant save/load requests from the UI thread and reports
 /// the outcome through [`SharedState::status`].
-fn handle_state_requests(core: &mut impl NesCore, shared: &SharedState, state_path: Option<&Path>) {
-    let Some(path) = state_path else {
+fn handle_state_requests(
+    core: &mut impl NesCore,
+    shared: &SharedState,
+    paths: Option<&StatePaths>,
+) {
+    let Some(paths) = paths else {
         return;
     };
-    if shared.save_state_req.swap(false, Ordering::Relaxed) {
+    let slot = shared.save_state_req.swap(0, Ordering::Relaxed);
+    if let Some(path) = slot_path(paths, slot) {
         let msg = match save_state_file(core, path) {
-            Ok(()) => "已存档".to_string(),
+            Ok(()) => format!("已存档 · 槽 {slot}"),
             Err(e) => e,
         };
         publish_status(shared, msg);
     }
-    if shared.load_state_req.swap(false, Ordering::Relaxed) {
+    let slot = shared.load_state_req.swap(0, Ordering::Relaxed);
+    if let Some(path) = slot_path(paths, slot) {
         let msg = match load_state_file(core, shared, path) {
-            Ok(()) => "已读档".to_string(),
+            Ok(()) => format!("已读档 · 槽 {slot}"),
+            Err(_) if !path.is_file() => format!("槽 {slot} 暂无存档"),
             Err(e) => e,
         };
         publish_status(shared, msg);
     }
 }
 
-/// Serializes the console state into the state file, creating its directory.
+/// Maps a one-based slot request to its file; 0 or out-of-range means none.
+fn slot_path(paths: &StatePaths, slot: u8) -> Option<&Path> {
+    (1..=STATE_SLOTS as u8)
+        .contains(&slot)
+        .then(|| paths.slots[usize::from(slot) - 1].as_path())
+}
+
+/// Serializes the console state into the state file, creating its directory,
+/// and writes the current frame as a raw RGBA thumbnail for the slot cards.
 fn save_state_file(core: &mut impl NesCore, path: &Path) -> Result<(), String> {
     let data = core.save_state().map_err(|e| format!("存档失败: {e}"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("存档失败: 创建目录出错 {e}"))?;
     }
     std::fs::write(path, data).map_err(|e| format!("存档失败: 写入文件出错 {e}"))?;
+    // A failed thumbnail only loses the preview, never the save.
+    if let Err(e) = std::fs::write(
+        path.with_extension("thumb"),
+        downscale_frame(core.frame_buffer()),
+    ) {
+        log::warn!("failed to write state thumbnail: {e}");
+    }
     log::info!("instant state saved to {path:?}");
     Ok(())
+}
+
+/// Downscales a full RGBA frame to thumbnail size by nearest sampling,
+/// which keeps the crisp retro pixels.
+fn downscale_frame(frame: &[u8]) -> Vec<u8> {
+    let src_width = playmate_core::SCREEN_WIDTH as usize;
+    let mut out = Vec::with_capacity(THUMB_WIDTH * THUMB_HEIGHT * 4);
+    for y in 0..THUMB_HEIGHT {
+        for x in 0..THUMB_WIDTH {
+            let src = ((y * 2) * src_width + x * 2) * 4;
+            out.extend_from_slice(&frame[src..src + 4]);
+        }
+    }
+    out
 }
 
 /// Restores the console from the state file and republishes the frame so the
@@ -219,6 +302,25 @@ fn load_state_file(
 fn publish_status(shared: &SharedState, msg: String) {
     if let Ok(mut status) = shared.status.lock() {
         *status = Some(msg);
+    }
+}
+
+/// Applies queued cheat mutations. Codes were validated by the UI, but a
+/// failure here still must not kill the emulation thread.
+fn handle_cheat_cmds(core: &mut impl NesCore, shared: &SharedState) {
+    let cmds: Vec<CheatCmd> = match shared.cheat_cmds.lock() {
+        Ok(mut lock) => lock.drain(..).collect(),
+        Err(_) => return,
+    };
+    for cmd in cmds {
+        match cmd {
+            CheatCmd::Add(code) => {
+                if let Err(e) = core.add_genie_code(&code) {
+                    log::warn!("failed to apply cheat {code}: {e}");
+                }
+            }
+            CheatCmd::Remove(code) => core.remove_genie_code(&code),
+        }
     }
 }
 

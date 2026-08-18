@@ -27,6 +27,9 @@ pub enum SettingsAction {
     Back,
     /// Restore default bindings.
     RestoreDefaults,
+    /// Switch the NTSC composite filter on or off; the application persists
+    /// the choice and applies it to a running session.
+    SetNtsc(bool),
 }
 
 /// Localized labels for bindable controls.
@@ -83,13 +86,25 @@ pub fn key_label(code: Option<KeyCode>) -> String {
 pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> SettingsAction {
     let mut action = SettingsAction::None;
     egui::CentralPanel::default().show(ui, |ui| {
-        if theme::page_header(ui, "设置 · 键位") {
+        if theme::page_header(ui, "设置") {
             action = SettingsAction::Back;
         }
 
         ui.columns(2, |cols| {
             player_keys_panel(&mut cols[0], cfg, state, Player::One, "P1 键位");
             player_keys_panel(&mut cols[1], cfg, state, Player::Two, "P2 键位");
+        });
+
+        ui.add_space(12.0);
+        // Video options; changes apply immediately, including mid-game.
+        ui.horizontal(|ui| {
+            let mut ntsc = cfg.video.ntsc_filter;
+            if ui
+                .checkbox(&mut ntsc, "NTSC 柔化滤镜（CRT 显像管观感，关闭为锐利点阵）")
+                .changed()
+            {
+                action = SettingsAction::SetNtsc(ntsc);
+            }
         });
 
         ui.add_space(12.0);
@@ -106,7 +121,7 @@ pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> Setti
             egui::RichText::new(
                 "提示：改动即时保存；同一物理键被重复绑定时会自动解除旧绑定；\
                  Esc 为保留键不可绑定。连发键按住时约每秒 15 连；\
-                 手柄无需配置，即插即用（X/Y 键为连发 B/A）。",
+                 手柄无需配置，即插即用（X/Y 键为连发 B/A，Mode 键呼出菜单）。",
             )
             .size(12.0)
             .color(theme::TEXT_WEAK),

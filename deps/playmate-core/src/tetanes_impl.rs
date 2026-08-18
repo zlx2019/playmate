@@ -8,10 +8,20 @@ use std::path::PathBuf;
 use tetanes_core::{
     common::ResetKind,
     control_deck::{Clocked, Config, ControlDeck},
+    genie::GenieCode,
     input::{JoypadBtn, Player as TetanesPlayer},
+    video::VideoFilter,
 };
 
 use crate::{Button, ButtonState, CoreError, NesCore, Player};
+
+/// Validates a Game Genie code (6 or 8 letters from the Game Genie alphabet)
+/// without a console and returns its normalized uppercase form.
+pub fn validate_genie_code(code: &str) -> Result<String, CoreError> {
+    GenieCode::new(code.to_string())
+        .map(|genie| genie.code().to_string())
+        .map_err(|e| CoreError::Genie(e.to_string()))
+}
 
 /// tetanes-core wrapper with default NTSC configuration and randomized power-on RAM.
 pub struct TetanesCore {
@@ -124,6 +134,14 @@ impl NesCore for TetanesCore {
         self.deck.set_frame_speed(speed);
     }
 
+    fn set_ntsc_filter(&mut self, enabled: bool) {
+        self.deck.set_filter(if enabled {
+            VideoFilter::Ntsc
+        } else {
+            VideoFilter::Pixellate
+        });
+    }
+
     fn reset(&mut self) {
         self.deck.reset(ResetKind::Soft);
     }
@@ -158,6 +176,16 @@ impl NesCore for TetanesCore {
         self.deck
             .load_state(&mut Cursor::new(data))
             .map_err(|e| CoreError::State(e.to_string()))
+    }
+
+    fn add_genie_code(&mut self, code: &str) -> Result<(), CoreError> {
+        self.deck
+            .add_genie_code(code.to_string())
+            .map_err(|e| CoreError::Genie(e.to_string()))
+    }
+
+    fn remove_genie_code(&mut self, code: &str) {
+        self.deck.remove_genie_code(code);
     }
 }
 
@@ -255,6 +283,22 @@ mod tests {
         core.clock_frame().unwrap();
 
         assert!(core.load_state(&[0u8; 16]).is_err());
+    }
+
+    /// Genie codes validate offline, normalize to uppercase, and apply to a
+    /// running console; garbage codes are rejected in both paths.
+    #[test]
+    fn genie_code_validation_and_application() {
+        assert_eq!(validate_genie_code("sxiopo").unwrap(), "SXIOPO");
+        assert!(validate_genie_code("NOTACODE").is_err());
+        assert!(validate_genie_code("SXIO").is_err());
+
+        let mut core = TetanesCore::new();
+        core.load_rom("synthetic", &synthetic_rom()).unwrap();
+        core.add_genie_code("SXIOPO").unwrap();
+        assert!(core.add_genie_code("QQQQQQ").is_err());
+        core.remove_genie_code("SXIOPO");
+        core.clock_frame().unwrap();
     }
 
     /// The synthetic ROM has no battery, so SRAM persistence is a no-op.

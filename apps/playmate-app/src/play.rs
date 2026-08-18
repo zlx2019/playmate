@@ -14,8 +14,10 @@ use playmate_core::{ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, T
 use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
-use crate::config::{self, InputMap};
-use crate::emu::{self, NetSink, SharedState};
+use crate::config::{self, Config, InputMap};
+use crate::emu::{
+    self, CheatCmd, NetSink, STATE_SLOTS, SharedState, StatePaths, THUMB_HEIGHT, THUMB_WIDTH,
+};
 use crate::gamepad::GamepadInput;
 
 /// How long a save/load result toast stays on screen.
@@ -54,14 +56,24 @@ pub struct PlaySession {
     /// Local player's slot in netplay. When set, local input writes only this
     /// slot and the network task writes the remote slot. `None` means local play.
     net_local_slot: Option<Player>,
+    /// Manual state-slot files, kept for the pause menu's occupancy markers.
+    state_slots: [std::path::PathBuf; STATE_SLOTS],
     /// Active save/load result toast with its display start time.
     toast: Option<(String, Instant)>,
 }
 
 impl PlaySession {
-    /// Loads a ROM for local play and starts emulation and audio.
-    pub fn start(rom_path: &Path) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, None)
+    /// Loads a ROM for local play and starts emulation and audio, applying
+    /// the game's enabled cheats and the configured video filter.
+    pub fn start(rom_path: &Path, cfg: &Config) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cfg, false)
+    }
+
+    /// Like [`start`](Self::start), but restores the auto snapshot written
+    /// when the previous session of this game ended. A missing or unreadable
+    /// snapshot degrades to a fresh start.
+    pub fn resume(rom_path: &Path, cfg: &Config) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cfg, true)
     }
 
     /// Starts host-mode netplay, using `local_slot` locally and sending media through `sink`.
@@ -69,12 +81,18 @@ impl PlaySession {
         rom_path: &Path,
         local_slot: Player,
         sink: NetSink,
+        cfg: &Config,
     ) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, Some((local_slot, sink)))
+        Self::start_with(rom_path, Some((local_slot, sink)), cfg, false)
     }
 
     /// Shared startup path.
-    fn start_with(rom_path: &Path, net: Option<(Player, NetSink)>) -> anyhow::Result<Self> {
+    fn start_with(
+        rom_path: &Path,
+        net: Option<(Player, NetSink)>,
+        cfg: &Config,
+        resume: bool,
+    ) -> anyhow::Result<Self> {
         let rom_bytes = std::fs::read(rom_path)
             .with_context(|| format!("无法读取 ROM 文件: {}", rom_path.display()))?;
         let rom_title = rom_path
@@ -89,6 +107,13 @@ impl PlaySession {
         core.load_rom(&rom_title, &rom_bytes)
             .with_context(|| format!("加载 ROM 失败: {rom_title}"))?;
 
+        // Apply the game's enabled cheat codes before the thread takes the core.
+        for code in cfg.enabled_cheats(&rom_title) {
+            if let Err(e) = core.add_genie_code(&code) {
+                log::warn!("skipping stored cheat {code}: {e}");
+            }
+        }
+
         let ring = Arc::new(AudioRing::new());
         let (audio_stream, sample_rate) = audio::start(Arc::clone(&ring), None)?;
         core.set_sample_rate(sample_rate as f32);
@@ -97,11 +122,40 @@ impl PlaySession {
             Some((slot, sink)) => (Some(slot), Some(sink)),
             None => (None, None),
         };
-        let state_path = saves_dir.join(format!("{rom_title}.state"));
+        // Slot 1 keeps the pre-multi-slot file name for compatibility.
+        let paths = StatePaths {
+            slots: [
+                saves_dir.join(format!("{rom_title}.state")),
+                saves_dir.join(format!("{rom_title}.slot2.state")),
+                saves_dir.join(format!("{rom_title}.slot3.state")),
+            ],
+            auto: saves_dir.join(format!("{rom_title}.auto.state")),
+        };
+        let state_slots = paths.slots.clone();
+
+        // Quick resume: restore the snapshot from the previous session end.
+        if resume {
+            match std::fs::read(&paths.auto) {
+                Ok(data) => match core.load_state(&data) {
+                    Ok(()) => {
+                        // The snapshot carries the previous session's APU
+                        // sample rate; the current device may differ.
+                        core.set_sample_rate(sample_rate as f32);
+                        log::info!("resumed from auto state {:?}", paths.auto);
+                    }
+                    Err(e) => log::warn!("ignoring unreadable auto state: {e}"),
+                },
+                Err(e) => log::info!("no auto state ({e}); starting fresh"),
+            }
+        }
+
         let shared = Arc::new(SharedState::new());
+        shared
+            .ntsc_filter
+            .store(cfg.video.ntsc_filter, Ordering::Relaxed);
         let emu_shared = Arc::clone(&shared);
         let emu_handle = std::thread::spawn(move || {
-            emu::run_emulation(core, emu_shared, ring, net_sink, Some(state_path));
+            emu::run_emulation(core, emu_shared, ring, net_sink, Some(paths));
         });
 
         log::info!("game started: {rom_title}");
@@ -116,6 +170,7 @@ impl PlaySession {
             turbo: [ButtonState::empty(); 2],
             started: Instant::now(),
             net_local_slot,
+            state_slots,
             toast: None,
         })
     }
@@ -203,19 +258,86 @@ impl PlaySession {
             .store(multiplier.max(1), Ordering::Relaxed);
     }
 
+    /// Queues applying a validated Game Genie code on the emulation thread.
+    pub fn add_cheat(&self, code: String) {
+        if let Ok(mut cmds) = self.shared.cheat_cmds.lock() {
+            cmds.push(CheatCmd::Add(code));
+        }
+    }
+
+    /// Queues removing an applied Game Genie code.
+    pub fn remove_cheat(&self, code: String) {
+        if let Ok(mut cmds) = self.shared.cheat_cmds.lock() {
+            cmds.push(CheatCmd::Remove(code));
+        }
+    }
+
     /// Whether fast-forward is currently engaged.
     pub fn is_fast_forward(&self) -> bool {
         self.shared.speed.load(Ordering::Relaxed) > 1
     }
 
-    /// Requests an instant state save, served by the emulation thread.
-    pub fn request_save_state(&self) {
-        self.shared.save_state_req.store(true, Ordering::Relaxed);
+    /// Applies the video filter choice to the running session.
+    pub fn set_ntsc_filter(&self, enabled: bool) {
+        self.shared.ntsc_filter.store(enabled, Ordering::Relaxed);
     }
 
-    /// Requests restoring the instant save state, served by the emulation thread.
-    pub fn request_load_state(&self) {
-        self.shared.load_state_req.store(true, Ordering::Relaxed);
+    /// Requests an instant state save into a one-based slot,
+    /// served by the emulation thread.
+    pub fn request_save_state(&self, slot: u8) {
+        self.shared
+            .save_state_req
+            .store(slot.clamp(1, STATE_SLOTS as u8), Ordering::Relaxed);
+    }
+
+    /// Requests restoring a one-based slot, served by the emulation thread.
+    pub fn request_load_state(&self, slot: u8) {
+        self.shared
+            .load_state_req
+            .store(slot.clamp(1, STATE_SLOTS as u8), Ordering::Relaxed);
+    }
+
+    /// Returns a manual slot's state file path for a one-based slot number.
+    fn slot_file(&self, slot: u8) -> Option<&std::path::PathBuf> {
+        usize::from(slot)
+            .checked_sub(1)
+            .and_then(|i| self.state_slots.get(i))
+    }
+
+    /// Modification time of a slot's state file; `None` means the slot is empty.
+    pub fn slot_mtime(&self, slot: u8) -> Option<std::time::SystemTime> {
+        std::fs::metadata(self.slot_file(slot)?)
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    /// Raw RGBA thumbnail for a slot, when present and well-formed.
+    /// Saves made before thumbnails existed simply have no preview.
+    pub fn slot_thumb(&self, slot: u8) -> Option<Vec<u8>> {
+        let data = std::fs::read(self.slot_file(slot)?.with_extension("thumb")).ok()?;
+        (data.len() == THUMB_WIDTH * THUMB_HEIGHT * 4).then_some(data)
+    }
+
+    /// Deletes a manual slot's saved state and reports the outcome as a toast.
+    /// Runs on the UI thread; the emulation thread only touches these files
+    /// while serving an explicit save/load request.
+    pub fn delete_state(&self, slot: u8) {
+        let Some(path) = self.slot_file(slot) else {
+            return;
+        };
+        // The thumbnail goes with the save; ignore a missing one.
+        let _ = std::fs::remove_file(path.with_extension("thumb"));
+        let msg = match std::fs::remove_file(path) {
+            Ok(()) => format!("已删除槽 {slot} 存档"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                format!("槽 {slot} 暂无存档")
+            }
+            Err(e) => format!("删除失败: {e}"),
+        };
+        if let Ok(mut status) = self.shared.status.lock() {
+            *status = Some(msg);
+        }
     }
 
     /// Returns the shared input cell for a player slot.

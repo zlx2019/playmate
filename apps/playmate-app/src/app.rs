@@ -180,40 +180,77 @@ impl PlaymateApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let mut nav = Nav::Stay;
         match &mut self.page {
-            Page::MainMenu => match main_menu::show(ui) {
-                MenuAction::None => {}
-                MenuAction::SinglePlayer => {
-                    nav = Nav::To(Box::new(Page::GameSelect {
-                        games: game_select::scan_roms(),
-                        error: None,
-                    }));
+            Page::MainMenu => {
+                // Offer quick resume only while the recorded ROM still exists.
+                let resume_title = self
+                    .cfg
+                    .last_game
+                    .as_deref()
+                    .filter(|p| p.is_file())
+                    .and_then(|p| p.file_stem())
+                    .map(|n| n.to_string_lossy().into_owned());
+                match main_menu::show(ui, resume_title.as_deref()) {
+                    MenuAction::None => {}
+                    MenuAction::Continue => {
+                        if let Some(path) = self.cfg.last_game.clone() {
+                            match PlaySession::resume(&path, &self.cfg) {
+                                Ok(session) => {
+                                    nav = Nav::To(Box::new(Page::Playing {
+                                        session,
+                                        net: None,
+                                        menu: GameMenu::default(),
+                                    }));
+                                }
+                                // Report the failure where an error slot exists.
+                                Err(e) => {
+                                    nav = Nav::To(Box::new(Page::GameSelect {
+                                        games: game_select::scan_roms(),
+                                        error: Some(format!("继续游戏失败: {e:#}")),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    MenuAction::SinglePlayer => {
+                        nav = Nav::To(Box::new(Page::GameSelect {
+                            games: game_select::scan_roms(),
+                            error: None,
+                        }));
+                    }
+                    MenuAction::LanPlay => {
+                        nav = Nav::To(Box::new(Page::LanLobby {
+                            state: LobbyState::new(),
+                        }));
+                    }
+                    MenuAction::Settings => {
+                        nav = Nav::To(Box::new(Page::Settings {
+                            state: SettingsState::default(),
+                        }));
+                    }
                 }
-                MenuAction::LanPlay => {
-                    nav = Nav::To(Box::new(Page::LanLobby {
-                        state: LobbyState::new(),
-                    }));
-                }
-                MenuAction::Settings => {
-                    nav = Nav::To(Box::new(Page::Settings {
-                        state: SettingsState::default(),
-                    }));
-                }
-            },
+            }
             Page::GameSelect { games, error } => {
                 match game_select::show(ui, games, error.as_deref()) {
                     GameSelectAction::None => {}
                     GameSelectAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                     GameSelectAction::Refresh => *games = game_select::scan_roms(),
-                    GameSelectAction::Play(path) => match PlaySession::start(&path) {
-                        Ok(session) => {
-                            nav = Nav::To(Box::new(Page::Playing {
-                                session,
-                                net: None,
-                                menu: GameMenu::default(),
-                            }));
+                    GameSelectAction::Play(path) => {
+                        match PlaySession::start(&path, &self.cfg) {
+                            Ok(session) => {
+                                // Remember the game for the main menu's quick resume.
+                                self.cfg.last_game = Some(path);
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save last game: {e:#}");
+                                }
+                                nav = Nav::To(Box::new(Page::Playing {
+                                    session,
+                                    net: None,
+                                    menu: GameMenu::default(),
+                                }));
+                            }
+                            Err(e) => *error = Some(format!("启动失败: {e:#}")),
                         }
-                        Err(e) => *error = Some(format!("启动失败: {e:#}")),
-                    },
+                    }
                 }
             }
             Page::Playing { session, net, menu } => {
@@ -248,6 +285,14 @@ impl PlaymateApp {
                                         egui::RichText::new("● 联机中")
                                             .color(egui::Color32::from_rgb(110, 200, 110)),
                                     );
+                                    // Seated player's measured round trip.
+                                    if let Some(ms) = net_state
+                                        .peer
+                                        .as_ref()
+                                        .and_then(|p| net_state.member_latency.get(p))
+                                    {
+                                        ui.label(room::latency_text(*ms));
+                                    }
                                 }
                             }
                         }
@@ -262,26 +307,112 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
-                    match game_menu::show(ui, &self.cfg, menu, net.is_none(), true) {
+                    let rom_title = session.rom_title.clone();
+                    match game_menu::show(
+                        ui,
+                        &self.cfg,
+                        menu,
+                        net.is_none(),
+                        &rom_title,
+                        Some(session),
+                    ) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
                         }
                         // Save/load close the menu so the result toast and the
                         // (possibly restored) frame are immediately visible.
-                        GameMenuAction::SaveState => {
-                            session.request_save_state();
+                        GameMenuAction::SaveState(slot) => {
+                            session.request_save_state(slot);
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
                         }
-                        GameMenuAction::LoadState => {
-                            session.request_load_state();
+                        GameMenuAction::LoadState(slot) => {
+                            session.request_load_state(slot);
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
+                        }
+                        // The menu stays open so the cleared marker is visible.
+                        GameMenuAction::DeleteState(slot) => session.delete_state(slot),
+                        GameMenuAction::AddCheat(raw) => {
+                            let (hint, added) = match playmate_core::validate_genie_code(&raw) {
+                                Ok(code) => {
+                                    let list = self
+                                        .cfg
+                                        .cheats
+                                        .entry(session.rom_title.clone())
+                                        .or_default();
+                                    if list.iter().any(|c| c.code == code) {
+                                        ("该码已存在".to_string(), false)
+                                    } else {
+                                        list.push(config::CheatEntry {
+                                            code: code.clone(),
+                                            enabled: true,
+                                        });
+                                        session.add_cheat(code);
+                                        if let Err(e) = config::save(&mut self.cfg) {
+                                            log::warn!("failed to save cheats: {e:#}");
+                                        }
+                                        ("已添加并生效".to_string(), true)
+                                    }
+                                }
+                                Err(e) => (e.to_string(), false),
+                            };
+                            if let Some(state) = &mut menu.cheats {
+                                if added {
+                                    state.input.clear();
+                                }
+                                state.hint = Some(hint);
+                            }
+                        }
+                        GameMenuAction::ToggleCheat(i) => {
+                            if let Some(entry) = self
+                                .cfg
+                                .cheats
+                                .get_mut(&session.rom_title)
+                                .and_then(|list| list.get_mut(i))
+                            {
+                                entry.enabled = !entry.enabled;
+                                if entry.enabled {
+                                    session.add_cheat(entry.code.clone());
+                                } else {
+                                    session.remove_cheat(entry.code.clone());
+                                }
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save cheats: {e:#}");
+                                }
+                            }
+                        }
+                        GameMenuAction::RemoveCheat(i) => {
+                            if let Some(list) = self.cfg.cheats.get_mut(&session.rom_title)
+                                && i < list.len()
+                            {
+                                let entry = list.remove(i);
+                                session.remove_cheat(entry.code);
+                                if list.is_empty() {
+                                    self.cfg.cheats.remove(&session.rom_title);
+                                }
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save cheats: {e:#}");
+                                }
+                            }
+                        }
+                        GameMenuAction::SetNtsc(on) => {
+                            self.cfg.video.ntsc_filter = on;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save video settings: {e:#}");
+                            }
+                            session.set_ntsc_filter(on);
                         }
                         // Netplay returns to the room for another game; local
                         // play drops the session and returns to the menu.
@@ -348,14 +479,29 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(ui, &self.cfg, menu, false, false) {
+                    match game_menu::show(ui, &self.cfg, menu, false, &play.rom_title, None) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
+                            menu.slots = None;
                         }
-                        // Guests never see save/load; the emulator is not local.
-                        GameMenuAction::SaveState | GameMenuAction::LoadState => {}
+                        // Guests never see save/load or cheats; the emulator is not local.
+                        GameMenuAction::SaveState(_)
+                        | GameMenuAction::LoadState(_)
+                        | GameMenuAction::DeleteState(_)
+                        | GameMenuAction::AddCheat(_)
+                        | GameMenuAction::ToggleCheat(_)
+                        | GameMenuAction::RemoveCheat(_) => {}
+                        // The stream is rendered host-side; persist the choice
+                        // for this machine's own local or hosted games.
+                        GameMenuAction::SetNtsc(on) => {
+                            self.cfg.video.ntsc_filter = on;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save video settings: {e:#}");
+                            }
+                        }
                         GameMenuAction::Exit => leave = true,
                         GameMenuAction::RestoreDefaults => restore_default_keys(
                             &mut self.cfg,
@@ -457,7 +603,12 @@ impl PlaymateApp {
                                 Player::One => Player::Two,
                                 Player::Two => Player::One,
                             };
-                            match PlaySession::start_networked(&path, state.my_slot, sink) {
+                            match PlaySession::start_networked(
+                                &path,
+                                state.my_slot,
+                                sink,
+                                &self.cfg,
+                            ) {
                                 Ok(session) => {
                                     nav = Nav::StartNetGame {
                                         session,
@@ -478,6 +629,12 @@ impl PlaymateApp {
                 SettingsAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                 SettingsAction::RestoreDefaults => {
                     restore_default_keys(&mut self.cfg, &mut self.input_map, Some(state));
+                }
+                SettingsAction::SetNtsc(on) => {
+                    self.cfg.video.ntsc_filter = on;
+                    if let Err(e) = config::save(&mut self.cfg) {
+                        log::warn!("failed to save video settings: {e:#}");
+                    }
                 }
             },
         }
@@ -516,6 +673,7 @@ impl PlaymateApp {
                         error: None,
                         notice: None,
                         latency_ms: None,
+                        member_latency: Default::default(),
                         swap_outgoing: false,
                         swap_incoming: None,
                         is_spectator: role == JoinRole::Spectator,
@@ -612,6 +770,7 @@ impl PlaymateApp {
                 error: None,
                 notice: None,
                 latency_ms: None,
+                member_latency: Default::default(),
                 swap_outgoing: false,
                 swap_incoming: None,
                 is_spectator: false,
@@ -671,6 +830,8 @@ impl PlaymateApp {
                     session.set_speed(1);
                 } else {
                     menu.settings = None;
+                    menu.cheats = None;
+                    menu.slots = None;
                 }
                 // Only local play truly pauses; a host game keeps running for peers.
                 session.set_paused(menu.open && net.is_none());
@@ -681,6 +842,8 @@ impl PlaymateApp {
                     play.clear_input();
                 } else {
                     menu.settings = None;
+                    menu.cheats = None;
+                    menu.slots = None;
                 }
             }
             _ => {}
@@ -810,12 +973,12 @@ impl ApplicationHandler for PlaymateApp {
                         } else if code == KeyCode::F5 {
                             // Instant save/load hotkeys, host-side only.
                             if toggle {
-                                session.request_save_state();
+                                session.request_save_state(1);
                             }
                             consumed_by_game = true;
                         } else if code == KeyCode::F9 {
                             if toggle {
-                                session.request_load_state();
+                                session.request_load_state(1);
                             }
                             consumed_by_game = true;
                         } else {
@@ -879,6 +1042,12 @@ impl ApplicationHandler for PlaymateApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Poll gamepads and publish or send input once per gameplay frame.
         self.gamepad.poll();
+        // Mode (guide) mirrors the Esc key so gamepad-only players can pause.
+        if self.gamepad.take_menu_press()
+            && matches!(self.page, Page::Playing { .. } | Page::GuestPlaying { .. })
+        {
+            self.toggle_game_menu();
+        }
         match &mut self.page {
             // Local play and hosts publish merged input directly to emulation.
             Page::Playing { session, menu, .. } => session.sync_input(&self.gamepad, menu.open),

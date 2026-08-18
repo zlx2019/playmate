@@ -4,7 +4,7 @@
 //! present; otherwise the built-in layout is used. Parse errors are reported
 //! instead of silently ignoring invalid user changes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -22,6 +22,61 @@ pub struct Config {
     /// Key binding configuration.
     #[serde(default)]
     pub keys: KeysConfig,
+    /// Game Genie cheat codes per game, keyed by ROM title.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cheats: BTreeMap<String, Vec<CheatEntry>>,
+    /// Most recently played local ROM, offered as quick resume on the main menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_game: Option<PathBuf>,
+    /// Video output options.
+    #[serde(default)]
+    pub video: VideoConfig,
+}
+
+/// Video output options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoConfig {
+    /// NTSC composite filter, the hardware-faithful softened look shown by a
+    /// CRT. Disabled means raw crisp pixels.
+    #[serde(default = "default_true")]
+    pub ntsc_filter: bool,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self { ntsc_filter: true }
+    }
+}
+
+/// serde helper matching [`VideoConfig::default`].
+fn default_true() -> bool {
+    true
+}
+
+/// One Game Genie cheat entry for a game.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheatEntry {
+    /// Normalized 6- or 8-letter Game Genie code.
+    pub code: String,
+    /// Whether the code is applied while the game runs.
+    pub enabled: bool,
+}
+
+impl Config {
+    /// Enabled cheat codes for a game, in stored order.
+    pub fn enabled_cheats(&self, rom_title: &str) -> Vec<String> {
+        self.cheats
+            .get(rom_title)
+            .map(|list| {
+                list.iter()
+                    .filter(|cheat| cheat.enabled)
+                    .map(|cheat| cheat.code.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Key binding sections for both players.

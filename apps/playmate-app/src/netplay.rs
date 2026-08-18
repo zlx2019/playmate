@@ -102,6 +102,13 @@ pub enum RoomEvent {
         /// Milliseconds between sending `Ping` and receiving `Pong`.
         rtt_ms: u32,
     },
+    /// A member's round trip measured by the broadcast heartbeat (host side).
+    MemberLatency {
+        /// Member display name as shown in the roster.
+        name: String,
+        /// Milliseconds between the broadcast `Ping` and this member's `Pong`.
+        rtt_ms: u32,
+    },
     /// The peer asked for a slot swap and awaits the local user's answer.
     SwapRequested,
     /// The peer declined the local user's swap request.
@@ -307,6 +314,8 @@ async fn host_task(
         in_tx,
     };
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // Broadcast time of the last heartbeat Ping, for per-member round trips.
+    let mut ping_sent = Instant::now();
 
     loop {
         tokio::select! {
@@ -319,6 +328,7 @@ async fn host_task(
             },
             Some(peer) = joined_rx.recv() => room.register(peer, game.as_ref()),
             Some(input) = in_rx.recv() => match input {
+                ConnIn::Msg(id, Message::Pong) => room.on_pong(id, ping_sent),
                 ConnIn::Msg(id, msg) => room.on_message(id, msg, game.as_ref(), &seats),
                 ConnIn::Closed(id) => room.remove(id, &seats, game.as_ref()),
             },
@@ -340,7 +350,10 @@ async fn host_task(
                     room.broadcast(Message::GameEnd);
                 }
             },
-            _ = heartbeat.tick() => room.broadcast(Message::Ping),
+            _ = heartbeat.tick() => {
+                ping_sent = Instant::now();
+                room.broadcast(Message::Ping);
+            }
         }
     }
 }
@@ -625,6 +638,16 @@ impl HostRoom {
     fn broadcast(&self, msg: Message) {
         for conn in &self.conns {
             let _ = conn.ctrl_tx.send(WriterCtrl::Send(msg.clone()));
+        }
+    }
+
+    /// Records a heartbeat answer as that member's round trip for the UI.
+    fn on_pong(&self, id: u64, ping_sent: Instant) {
+        if let Some(conn) = self.conns.iter().find(|c| c.id == id) {
+            let _ = self.event_tx.send(RoomEvent::MemberLatency {
+                name: conn.name.clone(),
+                rtt_ms: u32::try_from(ping_sent.elapsed().as_millis()).unwrap_or(u32::MAX),
+            });
         }
     }
 
