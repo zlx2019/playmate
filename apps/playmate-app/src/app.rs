@@ -285,6 +285,14 @@ impl PlaymateApp {
                                         egui::RichText::new("● 联机中")
                                             .color(egui::Color32::from_rgb(110, 200, 110)),
                                     );
+                                    // Seated player's measured round trip.
+                                    if let Some(ms) = net_state
+                                        .peer
+                                        .as_ref()
+                                        .and_then(|p| net_state.member_latency.get(p))
+                                    {
+                                        ui.label(room::latency_text(*ms));
+                                    }
                                 }
                             }
                         }
@@ -671,6 +679,7 @@ impl PlaymateApp {
                         error: None,
                         notice: None,
                         latency_ms: None,
+                        member_latency: Default::default(),
                         swap_outgoing: false,
                         swap_incoming: None,
                         is_spectator: role == JoinRole::Spectator,
@@ -767,6 +776,7 @@ impl PlaymateApp {
                 error: None,
                 notice: None,
                 latency_ms: None,
+                member_latency: Default::default(),
                 swap_outgoing: false,
                 swap_incoming: None,
                 is_spectator: false,

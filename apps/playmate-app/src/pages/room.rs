@@ -1,5 +1,6 @@
 //! Room page showing members and slots, slot swapping, and host game selection.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,6 +51,8 @@ pub struct RoomState {
     pub notice: Option<String>,
     /// Latest round-trip latency to the host in milliseconds (guest side only).
     pub latency_ms: Option<u32>,
+    /// Per-member round trips measured by the host's heartbeat (host side only).
+    pub member_latency: HashMap<String, u32>,
     /// Waiting for the peer to answer the local swap request.
     pub swap_outgoing: bool,
     /// Auto-decline deadline of the peer's pending swap request.
@@ -142,6 +145,10 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
                 state.notice = Some("对方拒绝了交换席位的请求".to_string());
             }
             RoomEvent::Roster { player, spectators } => {
+                // Drop latency entries for members no longer present.
+                state.member_latency.retain(|name, _| {
+                    player.as_deref() == Some(name.as_str()) || spectators.iter().any(|s| s == name)
+                });
                 state.roster_player = player;
                 state.spectators = spectators;
             }
@@ -188,6 +195,9 @@ pub fn apply_events(state: &mut RoomState) -> RoomUpdates {
             }
             RoomEvent::GameEnded => updates.game_ended = true,
             RoomEvent::Latency { rtt_ms } => state.latency_ms = Some(rtt_ms),
+            RoomEvent::MemberLatency { name, rtt_ms } => {
+                state.member_latency.insert(name, rtt_ms);
+            }
             RoomEvent::Reconnecting { attempt } => {
                 state.error = Some(format!("连接中断，正在自动重连…（第 {attempt} 次）"));
                 // The link is down; the last measurement no longer applies.
@@ -255,12 +265,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
             ui.label(egui::RichText::new(notice).color(theme::GREEN));
             ui.add_space(6.0);
         }
-        // Guest side: connection quality to the host at a glance.
-        if let Some(ms) = state.latency_ms {
-            ui.label(latency_text(ms));
-            ui.add_space(6.0);
-        }
-
         // Members and slots.
         theme::card().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -273,23 +277,30 @@ pub fn show(ui: &mut egui::Ui, state: &mut RoomState) -> RoomAction {
                     Player::One => Player::Two,
                     Player::Two => Player::One,
                 };
-                slot_row(ui, "主机", Some(host_seat), false);
+                slot_row(ui, "主机", Some(host_seat), false, state.latency_ms);
                 match &state.roster_player {
-                    Some(name) => slot_row(ui, name, Some(state.my_slot), false),
-                    None => slot_row(ui, "等待玩家加入…", None, false),
+                    Some(name) => slot_row(ui, name, Some(state.my_slot), false, None),
+                    None => slot_row(ui, "等待玩家加入…", None, false, None),
                 }
             } else {
                 let me = std::env::var("USER").unwrap_or_else(|_| "我".to_string());
-                slot_row(ui, &me, Some(state.my_slot), true);
+                slot_row(ui, &me, Some(state.my_slot), true, None);
                 match &state.peer {
                     Some(peer) => {
                         let peer_slot = match state.my_slot {
                             Player::One => Player::Two,
                             Player::Two => Player::One,
                         };
-                        slot_row(ui, peer, Some(peer_slot), false);
+                        // Host side: the member's measured round trip.
+                        // Guest side: the local link to the host.
+                        let latency = if state.is_host {
+                            state.member_latency.get(peer.as_str()).copied()
+                        } else {
+                            state.latency_ms
+                        };
+                        slot_row(ui, peer, Some(peer_slot), false, latency);
                     }
-                    None => slot_row(ui, "等待玩家加入…", None, false),
+                    None => slot_row(ui, "等待玩家加入…", None, false, None),
                 }
             }
             show_spectator_list(ui, state);
@@ -376,11 +387,15 @@ fn show_spectator_list(ui: &mut egui::Ui, state: &RoomState) {
         .spectators
         .iter()
         .map(|n| {
-            if state.is_spectator && *n == me {
+            let mut label = if state.is_spectator && *n == me {
                 format!("{n}（我）")
             } else {
                 n.clone()
+            };
+            if let Some(ms) = state.member_latency.get(n) {
+                label.push_str(&format!(" {ms}ms"));
             }
+            label
         })
         .collect();
     ui.label(
@@ -479,7 +494,13 @@ fn show_swap_controls(ui: &mut egui::Ui, state: &mut RoomState) {
 }
 
 /// One player row containing a slot badge and name.
-fn slot_row(ui: &mut egui::Ui, name: &str, slot: Option<Player>, is_me: bool) {
+fn slot_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    slot: Option<Player>,
+    is_me: bool,
+    latency: Option<u32>,
+) {
     ui.horizontal(|ui| {
         theme::slot_badge(ui, slot);
         let display = if is_me {
@@ -493,5 +514,8 @@ fn slot_row(ui: &mut egui::Ui, name: &str, slot: Option<Player>, is_me: bool) {
             egui::RichText::new(display).color(theme::TEXT_WEAK)
         };
         ui.label(text);
+        if let Some(ms) = latency {
+            ui.label(latency_text(ms));
+        }
     });
 }
