@@ -324,6 +324,9 @@ impl PlaymateApp {
                                     egui::RichText::new(status)
                                         .color(egui::Color32::from_rgb(110, 200, 110)),
                                 );
+                                if let Some(ms) = net.latency_ms {
+                                    ui.label(room::latency_text(ms));
+                                }
                             }
                         }
                     });
@@ -503,6 +506,7 @@ impl PlaymateApp {
                         selected: None,
                         error: None,
                         notice: None,
+                        latency_ms: None,
                         swap_outgoing: false,
                         swap_incoming: None,
                         is_spectator: role == JoinRole::Spectator,
@@ -598,6 +602,7 @@ impl PlaymateApp {
                 selected: None,
                 error: None,
                 notice: None,
+                latency_ms: None,
                 swap_outgoing: false,
                 swap_incoming: None,
                 is_spectator: false,
