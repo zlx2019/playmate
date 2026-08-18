@@ -121,7 +121,7 @@ pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> Setti
             egui::RichText::new(
                 "提示：改动即时保存；同一物理键被重复绑定时会自动解除旧绑定；\
                  Esc 为保留键不可绑定。连发键按住时约每秒 15 连；\
-                 手柄无需配置，即插即用（X/Y 键为连发 B/A）。",
+                 手柄无需配置，即插即用（X/Y 键为连发 B/A，Mode 键呼出菜单）。",
             )
             .size(12.0)
             .color(theme::TEXT_WEAK),

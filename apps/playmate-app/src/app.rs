@@ -1046,6 +1046,12 @@ impl ApplicationHandler for PlaymateApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Poll gamepads and publish or send input once per gameplay frame.
         self.gamepad.poll();
+        // Mode (guide) mirrors the Esc key so gamepad-only players can pause.
+        if self.gamepad.take_menu_press()
+            && matches!(self.page, Page::Playing { .. } | Page::GuestPlaying { .. })
+        {
+            self.toggle_game_menu();
+        }
         match &mut self.page {
             // Local play and hosts publish merged input directly to emulation.
             Page::Playing { session, menu, .. } => session.sync_input(&self.gamepad, menu.open),

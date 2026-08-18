@@ -5,6 +5,7 @@
 //! - South button (A) -> B, east button (B) -> A, preserving the console's B-left/A-right layout
 //! - West button (X) -> turbo B, north button (Y) -> turbo A, mirroring B/A one row up
 //! - Select/Back -> Select, Start/Menu -> Start
+//! - Mode (Xbox guide / PS button) -> toggles the in-game pause menu
 //!
 //! Gamepads are assigned to P1 and P2 in first-input order and released on disconnect.
 
@@ -24,6 +25,8 @@ pub struct GamepadInput {
     states: [ButtonState; 2],
     /// Turbo-held bitmap for each player; the caller applies the fire cadence.
     turbo: [ButtonState; 2],
+    /// Edge flag set by a Mode (guide) press, taken by the caller to toggle the menu.
+    menu_press: bool,
 }
 
 impl GamepadInput {
@@ -41,6 +44,7 @@ impl GamepadInput {
             slots: [None; 2],
             states: [ButtonState::empty(); 2],
             turbo: [ButtonState::empty(); 2],
+            menu_press: false,
         }
     }
 
@@ -55,11 +59,18 @@ impl GamepadInput {
                 &mut self.slots,
                 &mut self.states,
                 &mut self.turbo,
+                &mut self.menu_press,
                 gilrs,
                 event,
             );
         }
         changed
+    }
+
+    /// Returns and clears the pending Mode-press flag; the application
+    /// toggles the in-game menu on it, mirroring the Esc key.
+    pub fn take_menu_press(&mut self) -> bool {
+        std::mem::take(&mut self.menu_press)
     }
 
     /// Returns the current gamepad bitmap for a player.
@@ -101,10 +112,16 @@ impl GamepadInput {
         slots: &mut [Option<GamepadId>; 2],
         states: &mut [ButtonState; 2],
         turbo: &mut [ButtonState; 2],
+        menu_press: &mut bool,
         gilrs: &Gilrs,
         event: Event,
     ) -> bool {
         match event.event {
+            // Mode toggles the menu regardless of slot assignment.
+            EventType::ButtonPressed(PadButton::Mode, _) => {
+                *menu_press = true;
+                false
+            }
             EventType::ButtonPressed(button, _) => {
                 Self::apply_button(slots, states, turbo, gilrs, event.id, button, true)
             }
