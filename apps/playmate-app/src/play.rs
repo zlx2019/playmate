@@ -14,7 +14,7 @@ use playmate_core::{ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, T
 use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
-use crate::config::{self, InputMap};
+use crate::config::{self, Config, InputMap};
 use crate::emu::{self, CheatCmd, NetSink, SharedState, StatePaths};
 use crate::gamepad::GamepadInput;
 
@@ -59,17 +59,17 @@ pub struct PlaySession {
 }
 
 impl PlaySession {
-    /// Loads a ROM for local play and starts emulation and audio.
-    /// `cheats` holds the game's enabled Game Genie codes.
-    pub fn start(rom_path: &Path, cheats: &[String]) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, None, cheats, false)
+    /// Loads a ROM for local play and starts emulation and audio, applying
+    /// the game's enabled cheats and the configured video filter.
+    pub fn start(rom_path: &Path, cfg: &Config) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cfg, false)
     }
 
     /// Like [`start`](Self::start), but restores the auto snapshot written
     /// when the previous session of this game ended. A missing or unreadable
     /// snapshot degrades to a fresh start.
-    pub fn resume(rom_path: &Path, cheats: &[String]) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, None, cheats, true)
+    pub fn resume(rom_path: &Path, cfg: &Config) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cfg, true)
     }
 
     /// Starts host-mode netplay, using `local_slot` locally and sending media through `sink`.
@@ -77,16 +77,16 @@ impl PlaySession {
         rom_path: &Path,
         local_slot: Player,
         sink: NetSink,
-        cheats: &[String],
+        cfg: &Config,
     ) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, Some((local_slot, sink)), cheats, false)
+        Self::start_with(rom_path, Some((local_slot, sink)), cfg, false)
     }
 
     /// Shared startup path.
     fn start_with(
         rom_path: &Path,
         net: Option<(Player, NetSink)>,
-        cheats: &[String],
+        cfg: &Config,
         resume: bool,
     ) -> anyhow::Result<Self> {
         let rom_bytes = std::fs::read(rom_path)
@@ -104,8 +104,8 @@ impl PlaySession {
             .with_context(|| format!("加载 ROM 失败: {rom_title}"))?;
 
         // Apply the game's enabled cheat codes before the thread takes the core.
-        for code in cheats {
-            if let Err(e) = core.add_genie_code(code) {
+        for code in cfg.enabled_cheats(&rom_title) {
+            if let Err(e) = core.add_genie_code(&code) {
                 log::warn!("skipping stored cheat {code}: {e}");
             }
         }
@@ -140,6 +140,9 @@ impl PlaySession {
         }
 
         let shared = Arc::new(SharedState::new());
+        shared
+            .ntsc_filter
+            .store(cfg.video.ntsc_filter, Ordering::Relaxed);
         let emu_shared = Arc::clone(&shared);
         let emu_handle = std::thread::spawn(move || {
             emu::run_emulation(core, emu_shared, ring, net_sink, Some(paths));
@@ -261,6 +264,11 @@ impl PlaySession {
     /// Whether fast-forward is currently engaged.
     pub fn is_fast_forward(&self) -> bool {
         self.shared.speed.load(Ordering::Relaxed) > 1
+    }
+
+    /// Applies the video filter choice to the running session.
+    pub fn set_ntsc_filter(&self, enabled: bool) {
+        self.shared.ntsc_filter.store(enabled, Ordering::Relaxed);
     }
 
     /// Requests an instant state save, served by the emulation thread.

@@ -10,6 +10,7 @@ use tetanes_core::{
     control_deck::{Clocked, Config, ControlDeck},
     genie::GenieCode,
     input::{JoypadBtn, Player as TetanesPlayer},
+    video::VideoFilter,
 };
 
 use crate::{Button, ButtonState, CoreError, NesCore, Player};
@@ -131,6 +132,14 @@ impl NesCore for TetanesCore {
 
     fn set_frame_speed(&mut self, speed: f32) {
         self.deck.set_frame_speed(speed);
+    }
+
+    fn set_ntsc_filter(&mut self, enabled: bool) {
+        self.deck.set_filter(if enabled {
+            VideoFilter::Ntsc
+        } else {
+            VideoFilter::Pixellate
+        });
     }
 
     fn reset(&mut self) {

@@ -45,6 +45,10 @@ turbo_a = "Numpad2"
 # P2 默认不绑定 select（真机 2P 手柄没有 Select 键），需要时取消注释：
 # select = "NumpadSubtract"
 
+# 画面（设置页可视化管理）：
+# [video]
+# ntsc_filter = true    # NTSC 柔化滤镜（CRT 观感，默认开）；false = 锐利点阵
+
 # 金手指（Game Genie 码，按游戏名分组；游戏内暂停菜单可视化管理）：
 # 码为 6 或 8 位字母，与 ROM 版本（美版/日版）相关。
 # [[cheats."Super Mario Bros"]]

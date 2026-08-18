@@ -28,6 +28,30 @@ pub struct Config {
     /// Most recently played local ROM, offered as quick resume on the main menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_game: Option<PathBuf>,
+    /// Video output options.
+    #[serde(default)]
+    pub video: VideoConfig,
+}
+
+/// Video output options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoConfig {
+    /// NTSC composite filter, the hardware-faithful softened look shown by a
+    /// CRT. Disabled means raw crisp pixels.
+    #[serde(default = "default_true")]
+    pub ntsc_filter: bool,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self { ntsc_filter: true }
+    }
+}
+
+/// serde helper matching [`VideoConfig::default`].
+fn default_true() -> bool {
+    true
 }
 
 /// One Game Genie cheat entry for a game.

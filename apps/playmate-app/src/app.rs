@@ -193,9 +193,7 @@ impl PlaymateApp {
                     MenuAction::None => {}
                     MenuAction::Continue => {
                         if let Some(path) = self.cfg.last_game.clone() {
-                            let title = resume_title.unwrap_or_default();
-                            let cheats = self.cfg.enabled_cheats(&title);
-                            match PlaySession::resume(&path, &cheats) {
+                            match PlaySession::resume(&path, &self.cfg) {
                                 Ok(session) => {
                                     nav = Nav::To(Box::new(Page::Playing {
                                         session,
@@ -237,13 +235,7 @@ impl PlaymateApp {
                     GameSelectAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                     GameSelectAction::Refresh => *games = game_select::scan_roms(),
                     GameSelectAction::Play(path) => {
-                        // The cheat list is keyed by the same title the session derives.
-                        let title = path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let cheats = self.cfg.enabled_cheats(&title);
-                        match PlaySession::start(&path, &cheats) {
+                        match PlaySession::start(&path, &self.cfg) {
                             Ok(session) => {
                                 // Remember the game for the main menu's quick resume.
                                 self.cfg.last_game = Some(path);
@@ -401,6 +393,13 @@ impl PlaymateApp {
                                 }
                             }
                         }
+                        GameMenuAction::SetNtsc(on) => {
+                            self.cfg.video.ntsc_filter = on;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save video settings: {e:#}");
+                            }
+                            session.set_ntsc_filter(on);
+                        }
                         // Netplay returns to the room for another game; local
                         // play drops the session and returns to the menu.
                         GameMenuAction::Exit => nav = Nav::BackToRoom,
@@ -479,6 +478,14 @@ impl PlaymateApp {
                         | GameMenuAction::AddCheat(_)
                         | GameMenuAction::ToggleCheat(_)
                         | GameMenuAction::RemoveCheat(_) => {}
+                        // The stream is rendered host-side; persist the choice
+                        // for this machine's own local or hosted games.
+                        GameMenuAction::SetNtsc(on) => {
+                            self.cfg.video.ntsc_filter = on;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save video settings: {e:#}");
+                            }
+                        }
                         GameMenuAction::Exit => leave = true,
                         GameMenuAction::RestoreDefaults => restore_default_keys(
                             &mut self.cfg,
@@ -580,9 +587,12 @@ impl PlaymateApp {
                                 Player::One => Player::Two,
                                 Player::Two => Player::One,
                             };
-                            let cheats = self.cfg.enabled_cheats(&title);
-                            match PlaySession::start_networked(&path, state.my_slot, sink, &cheats)
-                            {
+                            match PlaySession::start_networked(
+                                &path,
+                                state.my_slot,
+                                sink,
+                                &self.cfg,
+                            ) {
                                 Ok(session) => {
                                     nav = Nav::StartNetGame {
                                         session,
@@ -603,6 +613,12 @@ impl PlaymateApp {
                 SettingsAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                 SettingsAction::RestoreDefaults => {
                     restore_default_keys(&mut self.cfg, &mut self.input_map, Some(state));
+                }
+                SettingsAction::SetNtsc(on) => {
+                    self.cfg.video.ntsc_filter = on;
+                    if let Err(e) = config::save(&mut self.cfg) {
+                        log::warn!("failed to save video settings: {e:#}");
+                    }
                 }
             },
         }

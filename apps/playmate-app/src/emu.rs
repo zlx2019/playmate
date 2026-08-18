@@ -59,6 +59,8 @@ pub struct SharedState {
     pub paused: AtomicBool,
     /// Emulation speed multiplier; 1 is normal, larger values fast-forward.
     pub speed: AtomicU8,
+    /// Whether the NTSC composite filter is active (the tetanes default).
+    pub ntsc_filter: AtomicBool,
     /// One-shot request to write an instant save state.
     pub save_state_req: AtomicBool,
     /// One-shot request to restore the instant save state.
@@ -80,6 +82,7 @@ impl SharedState {
             running: AtomicBool::new(true),
             paused: AtomicBool::new(false),
             speed: AtomicU8::new(1),
+            ntsc_filter: AtomicBool::new(true),
             save_state_req: AtomicBool::new(false),
             load_state_req: AtomicBool::new(false),
             status: Mutex::new(None),
@@ -104,6 +107,8 @@ pub fn run_emulation(
     let mut next = Instant::now() + frame_dur;
     let mut last_sram_save = Instant::now();
     let mut current_speed: u8 = 1;
+    // Matches both the deck's and SharedState's initial filter.
+    let mut current_ntsc = true;
 
     while shared.running.load(Ordering::Relaxed) {
         // 0. Serve instant save/load and cheat requests before the pause
@@ -130,6 +135,13 @@ pub fn run_emulation(
         if speed != current_speed {
             current_speed = speed;
             core.set_frame_speed(f32::from(speed));
+        }
+
+        // 1.6 Video filter switches apply between frames.
+        let ntsc = shared.ntsc_filter.load(Ordering::Relaxed);
+        if ntsc != current_ntsc {
+            current_ntsc = ntsc;
+            core.set_ntsc_filter(ntsc);
         }
 
         // 2. Replace both players' input with the latest state.

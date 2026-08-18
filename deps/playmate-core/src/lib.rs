@@ -67,6 +67,11 @@ pub trait NesCore {
     /// stays constant while sounding sped up.
     fn set_frame_speed(&mut self, speed: f32);
 
+    /// Switches between the NTSC composite filter (CRT-like softening, the
+    /// hardware-faithful default) and raw per-pixel palette output.
+    /// The frame buffer size is unaffected.
+    fn set_ntsc_filter(&mut self, enabled: bool);
+
     /// Performs a soft reset, equivalent to pressing Reset on the console.
     fn reset(&mut self);
 
