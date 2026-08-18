@@ -307,25 +307,21 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
-                    let slots_used = [
-                        session.slot_used(1),
-                        session.slot_used(2),
-                        session.slot_used(3),
-                    ];
+                    let rom_title = session.rom_title.clone();
                     match game_menu::show(
                         ui,
                         &self.cfg,
                         menu,
                         net.is_none(),
-                        true,
-                        &session.rom_title,
-                        slots_used,
+                        &rom_title,
+                        Some(session),
                     ) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
                         }
                         // Save/load close the menu so the result toast and the
@@ -335,6 +331,7 @@ impl PlaymateApp {
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
                         }
                         GameMenuAction::LoadState(slot) => {
@@ -342,8 +339,11 @@ impl PlaymateApp {
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
+                            menu.slots = None;
                             session.set_paused(false);
                         }
+                        // The menu stays open so the cleared marker is visible.
+                        GameMenuAction::DeleteState(slot) => session.delete_state(slot),
                         GameMenuAction::AddCheat(raw) => {
                             let (hint, added) = match playmate_core::validate_genie_code(&raw) {
                                 Ok(code) => {
@@ -479,24 +479,18 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(
-                        ui,
-                        &self.cfg,
-                        menu,
-                        false,
-                        false,
-                        &play.rom_title,
-                        [false; 3],
-                    ) {
+                    match game_menu::show(ui, &self.cfg, menu, false, &play.rom_title, None) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
+                            menu.slots = None;
                         }
                         // Guests never see save/load or cheats; the emulator is not local.
                         GameMenuAction::SaveState(_)
                         | GameMenuAction::LoadState(_)
+                        | GameMenuAction::DeleteState(_)
                         | GameMenuAction::AddCheat(_)
                         | GameMenuAction::ToggleCheat(_)
                         | GameMenuAction::RemoveCheat(_) => {}
@@ -837,6 +831,7 @@ impl PlaymateApp {
                 } else {
                     menu.settings = None;
                     menu.cheats = None;
+                    menu.slots = None;
                 }
                 // Only local play truly pauses; a host game keeps running for peers.
                 session.set_paused(menu.open && net.is_none());
@@ -848,6 +843,7 @@ impl PlaymateApp {
                 } else {
                     menu.settings = None;
                     menu.cheats = None;
+                    menu.slots = None;
                 }
             }
             _ => {}

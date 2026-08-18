@@ -15,7 +15,9 @@ use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
 use crate::config::{self, Config, InputMap};
-use crate::emu::{self, CheatCmd, NetSink, STATE_SLOTS, SharedState, StatePaths};
+use crate::emu::{
+    self, CheatCmd, NetSink, STATE_SLOTS, SharedState, StatePaths, THUMB_HEIGHT, THUMB_WIDTH,
+};
 use crate::gamepad::GamepadInput;
 
 /// How long a save/load result toast stays on screen.
@@ -295,12 +297,47 @@ impl PlaySession {
             .store(slot.clamp(1, STATE_SLOTS as u8), Ordering::Relaxed);
     }
 
-    /// Whether a manual slot already holds a saved state, for menu markers.
-    pub fn slot_used(&self, slot: u8) -> bool {
+    /// Returns a manual slot's state file path for a one-based slot number.
+    fn slot_file(&self, slot: u8) -> Option<&std::path::PathBuf> {
         usize::from(slot)
             .checked_sub(1)
             .and_then(|i| self.state_slots.get(i))
-            .is_some_and(|p| p.is_file())
+    }
+
+    /// Modification time of a slot's state file; `None` means the slot is empty.
+    pub fn slot_mtime(&self, slot: u8) -> Option<std::time::SystemTime> {
+        std::fs::metadata(self.slot_file(slot)?)
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    /// Raw RGBA thumbnail for a slot, when present and well-formed.
+    /// Saves made before thumbnails existed simply have no preview.
+    pub fn slot_thumb(&self, slot: u8) -> Option<Vec<u8>> {
+        let data = std::fs::read(self.slot_file(slot)?.with_extension("thumb")).ok()?;
+        (data.len() == THUMB_WIDTH * THUMB_HEIGHT * 4).then_some(data)
+    }
+
+    /// Deletes a manual slot's saved state and reports the outcome as a toast.
+    /// Runs on the UI thread; the emulation thread only touches these files
+    /// while serving an explicit save/load request.
+    pub fn delete_state(&self, slot: u8) {
+        let Some(path) = self.slot_file(slot) else {
+            return;
+        };
+        // The thumbnail goes with the save; ignore a missing one.
+        let _ = std::fs::remove_file(path.with_extension("thumb"));
+        let msg = match std::fs::remove_file(path) {
+            Ok(()) => format!("已删除槽 {slot} 存档"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                format!("槽 {slot} 暂无存档")
+            }
+            Err(e) => format!("删除失败: {e}"),
+        };
+        if let Ok(mut status) = self.shared.status.lock() {
+            *status = Some(msg);
+        }
     }
 
     /// Returns the shared input cell for a player slot.

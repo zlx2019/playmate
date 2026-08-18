@@ -26,6 +26,12 @@ const SRAM_AUTOSAVE: Duration = Duration::from_secs(60);
 /// Number of manual instant-state slots per game.
 pub const STATE_SLOTS: usize = 3;
 
+/// Save-state thumbnail width: half the NES frame, nearest-sampled.
+pub const THUMB_WIDTH: usize = 128;
+
+/// Save-state thumbnail height: half the NES frame, nearest-sampled.
+pub const THUMB_HEIGHT: usize = 120;
+
 /// Instant-state file locations for one game.
 pub struct StatePaths {
     /// Manual slot files; index 0 is slot 1, the F5/F9 quick slot.
@@ -239,15 +245,37 @@ fn slot_path(paths: &StatePaths, slot: u8) -> Option<&Path> {
         .then(|| paths.slots[usize::from(slot) - 1].as_path())
 }
 
-/// Serializes the console state into the state file, creating its directory.
+/// Serializes the console state into the state file, creating its directory,
+/// and writes the current frame as a raw RGBA thumbnail for the slot cards.
 fn save_state_file(core: &mut impl NesCore, path: &Path) -> Result<(), String> {
     let data = core.save_state().map_err(|e| format!("存档失败: {e}"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("存档失败: 创建目录出错 {e}"))?;
     }
     std::fs::write(path, data).map_err(|e| format!("存档失败: 写入文件出错 {e}"))?;
+    // A failed thumbnail only loses the preview, never the save.
+    if let Err(e) = std::fs::write(
+        path.with_extension("thumb"),
+        downscale_frame(core.frame_buffer()),
+    ) {
+        log::warn!("failed to write state thumbnail: {e}");
+    }
     log::info!("instant state saved to {path:?}");
     Ok(())
+}
+
+/// Downscales a full RGBA frame to thumbnail size by nearest sampling,
+/// which keeps the crisp retro pixels.
+fn downscale_frame(frame: &[u8]) -> Vec<u8> {
+    let src_width = playmate_core::SCREEN_WIDTH as usize;
+    let mut out = Vec::with_capacity(THUMB_WIDTH * THUMB_HEIGHT * 4);
+    for y in 0..THUMB_HEIGHT {
+        for x in 0..THUMB_WIDTH {
+            let src = ((y * 2) * src_width + x * 2) * 4;
+            out.extend_from_slice(&frame[src..src + 4]);
+        }
+    }
+    out
 }
 
 /// Restores the console from the state file and republishes the frame so the
