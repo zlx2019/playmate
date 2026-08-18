@@ -23,6 +23,14 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 /// crash; a final write also happens when the session ends.
 const SRAM_AUTOSAVE: Duration = Duration::from_secs(60);
 
+/// Cheat mutation requested by the UI and served by the emulation thread.
+pub enum CheatCmd {
+    /// Apply a Game Genie code, already validated by the UI.
+    Add(String),
+    /// Remove an applied Game Genie code.
+    Remove(String),
+}
+
 /// Media output channels from emulation to the network sender in host mode.
 pub struct NetSink {
     /// Raw RGBA frames; the small bounded queue may drop frames rather than block emulation.
@@ -49,6 +57,8 @@ pub struct SharedState {
     pub load_state_req: AtomicBool,
     /// Latest save/load result message, taken by the UI for a transient toast.
     pub status: Mutex<Option<String>>,
+    /// Pending cheat mutations, drained by the emulation thread.
+    pub cheat_cmds: Mutex<Vec<CheatCmd>>,
     /// Latest RGBA8 frame, always [`FRAME_BYTES`] bytes.
     pub framebuffer: Mutex<Vec<u8>>,
 }
@@ -65,6 +75,7 @@ impl SharedState {
             save_state_req: AtomicBool::new(false),
             load_state_req: AtomicBool::new(false),
             status: Mutex::new(None),
+            cheat_cmds: Mutex::new(Vec::new()),
             framebuffer: Mutex::new(vec![0u8; FRAME_BYTES]),
         }
     }
@@ -87,9 +98,10 @@ pub fn run_emulation(
     let mut current_speed: u8 = 1;
 
     while shared.running.load(Ordering::Relaxed) {
-        // 0. Serve instant save/load requests before the pause check, so the
-        // pause-menu actions work while local play is paused.
+        // 0. Serve instant save/load and cheat requests before the pause
+        // check, so the pause-menu actions work while local play is paused.
         handle_state_requests(&mut core, &shared, state_path.as_deref());
+        handle_cheat_cmds(&mut core, &shared);
 
         // 1. Paused (local play): idle without stepping and hold the frame
         // clock so resuming does not fast-forward the missed frames.
@@ -219,6 +231,25 @@ fn load_state_file(
 fn publish_status(shared: &SharedState, msg: String) {
     if let Ok(mut status) = shared.status.lock() {
         *status = Some(msg);
+    }
+}
+
+/// Applies queued cheat mutations. Codes were validated by the UI, but a
+/// failure here still must not kill the emulation thread.
+fn handle_cheat_cmds(core: &mut impl NesCore, shared: &SharedState) {
+    let cmds: Vec<CheatCmd> = match shared.cheat_cmds.lock() {
+        Ok(mut lock) => lock.drain(..).collect(),
+        Err(_) => return,
+    };
+    for cmd in cmds {
+        match cmd {
+            CheatCmd::Add(code) => {
+                if let Err(e) = core.add_genie_code(&code) {
+                    log::warn!("failed to apply cheat {code}: {e}");
+                }
+            }
+            CheatCmd::Remove(code) => core.remove_genie_code(&code),
+        }
     }
 }
 

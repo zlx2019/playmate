@@ -15,7 +15,7 @@ use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
 use crate::config::{self, InputMap};
-use crate::emu::{self, NetSink, SharedState};
+use crate::emu::{self, CheatCmd, NetSink, SharedState};
 use crate::gamepad::GamepadInput;
 
 /// How long a save/load result toast stays on screen.
@@ -60,8 +60,9 @@ pub struct PlaySession {
 
 impl PlaySession {
     /// Loads a ROM for local play and starts emulation and audio.
-    pub fn start(rom_path: &Path) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, None)
+    /// `cheats` holds the game's enabled Game Genie codes.
+    pub fn start(rom_path: &Path, cheats: &[String]) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cheats)
     }
 
     /// Starts host-mode netplay, using `local_slot` locally and sending media through `sink`.
@@ -69,12 +70,17 @@ impl PlaySession {
         rom_path: &Path,
         local_slot: Player,
         sink: NetSink,
+        cheats: &[String],
     ) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, Some((local_slot, sink)))
+        Self::start_with(rom_path, Some((local_slot, sink)), cheats)
     }
 
     /// Shared startup path.
-    fn start_with(rom_path: &Path, net: Option<(Player, NetSink)>) -> anyhow::Result<Self> {
+    fn start_with(
+        rom_path: &Path,
+        net: Option<(Player, NetSink)>,
+        cheats: &[String],
+    ) -> anyhow::Result<Self> {
         let rom_bytes = std::fs::read(rom_path)
             .with_context(|| format!("无法读取 ROM 文件: {}", rom_path.display()))?;
         let rom_title = rom_path
@@ -88,6 +94,13 @@ impl PlaySession {
         let mut core = TetanesCore::with_sram_dir(Some(saves_dir.clone()));
         core.load_rom(&rom_title, &rom_bytes)
             .with_context(|| format!("加载 ROM 失败: {rom_title}"))?;
+
+        // Apply the game's enabled cheat codes before the thread takes the core.
+        for code in cheats {
+            if let Err(e) = core.add_genie_code(code) {
+                log::warn!("skipping stored cheat {code}: {e}");
+            }
+        }
 
         let ring = Arc::new(AudioRing::new());
         let (audio_stream, sample_rate) = audio::start(Arc::clone(&ring), None)?;
@@ -201,6 +214,20 @@ impl PlaySession {
         self.shared
             .speed
             .store(multiplier.max(1), Ordering::Relaxed);
+    }
+
+    /// Queues applying a validated Game Genie code on the emulation thread.
+    pub fn add_cheat(&self, code: String) {
+        if let Ok(mut cmds) = self.shared.cheat_cmds.lock() {
+            cmds.push(CheatCmd::Add(code));
+        }
+    }
+
+    /// Queues removing an applied Game Genie code.
+    pub fn remove_cheat(&self, code: String) {
+        if let Ok(mut cmds) = self.shared.cheat_cmds.lock() {
+            cmds.push(CheatCmd::Remove(code));
+        }
     }
 
     /// Whether fast-forward is currently engaged.

@@ -204,16 +204,24 @@ impl PlaymateApp {
                     GameSelectAction::None => {}
                     GameSelectAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
                     GameSelectAction::Refresh => *games = game_select::scan_roms(),
-                    GameSelectAction::Play(path) => match PlaySession::start(&path) {
-                        Ok(session) => {
-                            nav = Nav::To(Box::new(Page::Playing {
-                                session,
-                                net: None,
-                                menu: GameMenu::default(),
-                            }));
+                    GameSelectAction::Play(path) => {
+                        // The cheat list is keyed by the same title the session derives.
+                        let title = path
+                            .file_stem()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let cheats = self.cfg.enabled_cheats(&title);
+                        match PlaySession::start(&path, &cheats) {
+                            Ok(session) => {
+                                nav = Nav::To(Box::new(Page::Playing {
+                                    session,
+                                    net: None,
+                                    menu: GameMenu::default(),
+                                }));
+                            }
+                            Err(e) => *error = Some(format!("启动失败: {e:#}")),
                         }
-                        Err(e) => *error = Some(format!("启动失败: {e:#}")),
-                    },
+                    }
                 }
             }
             Page::Playing { session, net, menu } => {
@@ -262,11 +270,19 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
-                    match game_menu::show(ui, &self.cfg, menu, net.is_none(), true) {
+                    match game_menu::show(
+                        ui,
+                        &self.cfg,
+                        menu,
+                        net.is_none(),
+                        true,
+                        &session.rom_title,
+                    ) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
                             session.set_paused(false);
                         }
                         // Save/load close the menu so the result toast and the
@@ -275,13 +291,78 @@ impl PlaymateApp {
                             session.request_save_state();
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
                             session.set_paused(false);
                         }
                         GameMenuAction::LoadState => {
                             session.request_load_state();
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
                             session.set_paused(false);
+                        }
+                        GameMenuAction::AddCheat(raw) => {
+                            let (hint, added) = match playmate_core::validate_genie_code(&raw) {
+                                Ok(code) => {
+                                    let list = self
+                                        .cfg
+                                        .cheats
+                                        .entry(session.rom_title.clone())
+                                        .or_default();
+                                    if list.iter().any(|c| c.code == code) {
+                                        ("该码已存在".to_string(), false)
+                                    } else {
+                                        list.push(config::CheatEntry {
+                                            code: code.clone(),
+                                            enabled: true,
+                                        });
+                                        session.add_cheat(code);
+                                        if let Err(e) = config::save(&mut self.cfg) {
+                                            log::warn!("failed to save cheats: {e:#}");
+                                        }
+                                        ("已添加并生效".to_string(), true)
+                                    }
+                                }
+                                Err(e) => (e.to_string(), false),
+                            };
+                            if let Some(state) = &mut menu.cheats {
+                                if added {
+                                    state.input.clear();
+                                }
+                                state.hint = Some(hint);
+                            }
+                        }
+                        GameMenuAction::ToggleCheat(i) => {
+                            if let Some(entry) = self
+                                .cfg
+                                .cheats
+                                .get_mut(&session.rom_title)
+                                .and_then(|list| list.get_mut(i))
+                            {
+                                entry.enabled = !entry.enabled;
+                                if entry.enabled {
+                                    session.add_cheat(entry.code.clone());
+                                } else {
+                                    session.remove_cheat(entry.code.clone());
+                                }
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save cheats: {e:#}");
+                                }
+                            }
+                        }
+                        GameMenuAction::RemoveCheat(i) => {
+                            if let Some(list) = self.cfg.cheats.get_mut(&session.rom_title)
+                                && i < list.len()
+                            {
+                                let entry = list.remove(i);
+                                session.remove_cheat(entry.code);
+                                if list.is_empty() {
+                                    self.cfg.cheats.remove(&session.rom_title);
+                                }
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save cheats: {e:#}");
+                                }
+                            }
                         }
                         // Netplay returns to the room for another game; local
                         // play drops the session and returns to the menu.
@@ -348,14 +429,19 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(ui, &self.cfg, menu, false, false) {
+                    match game_menu::show(ui, &self.cfg, menu, false, false, &play.rom_title) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
+                            menu.cheats = None;
                         }
-                        // Guests never see save/load; the emulator is not local.
-                        GameMenuAction::SaveState | GameMenuAction::LoadState => {}
+                        // Guests never see save/load or cheats; the emulator is not local.
+                        GameMenuAction::SaveState
+                        | GameMenuAction::LoadState
+                        | GameMenuAction::AddCheat(_)
+                        | GameMenuAction::ToggleCheat(_)
+                        | GameMenuAction::RemoveCheat(_) => {}
                         GameMenuAction::Exit => leave = true,
                         GameMenuAction::RestoreDefaults => restore_default_keys(
                             &mut self.cfg,
@@ -457,7 +543,9 @@ impl PlaymateApp {
                                 Player::One => Player::Two,
                                 Player::Two => Player::One,
                             };
-                            match PlaySession::start_networked(&path, state.my_slot, sink) {
+                            let cheats = self.cfg.enabled_cheats(&title);
+                            match PlaySession::start_networked(&path, state.my_slot, sink, &cheats)
+                            {
                                 Ok(session) => {
                                     nav = Nav::StartNetGame {
                                         session,
@@ -671,6 +759,7 @@ impl PlaymateApp {
                     session.set_speed(1);
                 } else {
                     menu.settings = None;
+                    menu.cheats = None;
                 }
                 // Only local play truly pauses; a host game keeps running for peers.
                 session.set_paused(menu.open && net.is_none());
@@ -681,6 +770,7 @@ impl PlaymateApp {
                     play.clear_input();
                 } else {
                     menu.settings = None;
+                    menu.cheats = None;
                 }
             }
             _ => {}
