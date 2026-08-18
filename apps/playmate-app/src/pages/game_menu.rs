@@ -39,8 +39,8 @@ pub struct SlotsState {
 pub struct CheatsState {
     /// Code currently being typed.
     pub input: String,
-    /// Validation or result hint below the input row.
-    pub hint: Option<String>,
+    /// Result hint below the input row and whether it reports success.
+    pub hint: Option<(String, bool)>,
 }
 
 /// Action triggered by the overlay.
@@ -132,7 +132,7 @@ pub fn show(
                         menu.slots = Some(SlotsState::default());
                     }
                     ui.add_space(4.0);
-                    if menu_button(ui, "金手指").clicked() {
+                    if menu_button(ui, "作弊码").clicked() {
                         menu.cheats = Some(CheatsState::default());
                     }
                 }
@@ -150,8 +150,8 @@ pub fn show(
     action
 }
 
-/// Cheat editor: list of stored codes with enable/delete controls plus an
-/// input row for new codes. Mutations are reported as actions; the
+/// Cheat editor: stored codes as sunken chip rows with enable and delete
+/// controls, plus a framed input row. Mutations are reported as actions; the
 /// application owns validation, persistence, and applying to the console.
 fn cheats_view(
     ui: &mut egui::Ui,
@@ -164,66 +164,125 @@ fn cheats_view(
         if ui.button("‹ 返回").clicked() {
             menu.cheats = None;
         }
-        ui.label(egui::RichText::new("金手指").strong());
-        ui.label(
-            egui::RichText::new(rom_title)
-                .size(12.0)
-                .color(theme::TEXT_WEAK),
-        );
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("作弊码").strong().size(16.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(rom_title)
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        });
     });
     let Some(state) = &mut menu.cheats else {
         return action;
     };
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     let entries = cfg.cheats.get(rom_title).map(Vec::as_slice).unwrap_or(&[]);
     if entries.is_empty() {
-        ui.label(egui::RichText::new("尚无金手指，输入 6 或 8 位码添加").color(theme::TEXT_WEAK));
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("尚无作弊码").color(theme::TEXT_WEAK));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("输入 6 或 8 位 Game Genie 码，如 SXIOPO（超马无限命）")
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        });
+        ui.add_space(14.0);
     } else {
-        for (i, entry) in entries.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let mut enabled = entry.enabled;
-                if ui.checkbox(&mut enabled, "").changed() {
-                    action = GameMenuAction::ToggleCheat(i);
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (i, entry) in entries.iter().enumerate() {
+                    cheat_chip(ui, i, entry, &mut action);
                 }
-                ui.label(
-                    egui::RichText::new(&entry.code)
-                        .monospace()
-                        .strong()
-                        .size(16.0),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("删除").clicked() {
-                        action = GameMenuAction::RemoveCheat(i);
-                    }
-                });
             });
-        }
     }
 
+    ui.add_space(10.0);
+    ui.separator();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let edit = egui::TextEdit::singleline(&mut state.input)
-            .desired_width(160.0)
+            .desired_width(ui.available_width() - 88.0)
             .char_limit(8)
-            .font(egui::FontId::monospace(16.0))
-            .hint_text("SXIOPO");
+            .font(egui::FontId::monospace(18.0))
+            .hint_text("输入作弊码");
         let submitted = ui.add(edit).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (ui.button("添加").clicked() || submitted) && !state.input.trim().is_empty() {
+        let filled = !state.input.trim().is_empty();
+        // A compact inline primary button; theme::primary_button is
+        // full-width and would overflow this row.
+        let add = egui::Button::new(
+            egui::RichText::new("添加")
+                .size(14.0)
+                .strong()
+                .color(egui::Color32::WHITE),
+        )
+        .fill(theme::RED)
+        .min_size(egui::vec2(72.0, 30.0));
+        if (ui.add_enabled(filled, add).clicked() || submitted) && filled {
             action = GameMenuAction::AddCheat(state.input.trim().to_string());
         }
     });
-    if let Some(hint) = &state.hint {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(hint).size(12.0).color(theme::GREEN));
+    if let Some((hint, ok)) = &state.hint {
+        ui.add_space(6.0);
+        let color = if *ok { theme::GREEN } else { theme::RED_BRIGHT };
+        ui.label(egui::RichText::new(hint).size(12.0).color(color));
     }
-    ui.add_space(4.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new("码与 ROM 版本相关（美版/日版不通用），无效果时请核对版本")
-            .size(12.0)
+            .size(11.0)
             .color(theme::TEXT_WEAK),
     );
     action
+}
+
+/// One stored cheat as a full-width sunken chip: enable checkbox, the code
+/// in monospace, and a right-aligned delete button.
+fn cheat_chip(
+    ui: &mut egui::Ui,
+    index: usize,
+    entry: &crate::config::CheatEntry,
+    action: &mut GameMenuAction,
+) {
+    egui::Frame::new()
+        .fill(theme::SUNKEN)
+        .stroke(egui::Stroke::new(1.0, theme::OUTLINE))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let mut enabled = entry.enabled;
+                if ui.checkbox(&mut enabled, "").changed() {
+                    *action = GameMenuAction::ToggleCheat(index);
+                }
+                let code = egui::RichText::new(&entry.code).monospace().size(16.0);
+                let code = if entry.enabled {
+                    code.strong().color(theme::GREEN)
+                } else {
+                    code.color(theme::TEXT_WEAK)
+                };
+                ui.label(code);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(
+                            egui::RichText::new("删除")
+                                .size(12.0)
+                                .color(theme::RED_BRIGHT),
+                        )
+                        .clicked()
+                    {
+                        *action = GameMenuAction::RemoveCheat(index);
+                    }
+                });
+            });
+        });
 }
 
 /// Full-width overlay button.

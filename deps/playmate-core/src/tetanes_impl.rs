@@ -178,6 +178,24 @@ impl NesCore for TetanesCore {
             .map_err(|e| CoreError::State(e.to_string()))
     }
 
+    fn state_len(&self) -> Result<usize, CoreError> {
+        self.deck
+            .serialized_state_len()
+            .map_err(|e| CoreError::State(e.to_string()))
+    }
+
+    fn serialize_state(&self, dst: &mut [u8]) -> Result<usize, CoreError> {
+        self.deck
+            .serialize_state_into(dst)
+            .map_err(|e| CoreError::State(e.to_string()))
+    }
+
+    fn deserialize_state(&mut self, src: &[u8]) -> Result<(), CoreError> {
+        self.deck
+            .deserialize_state(src)
+            .map_err(|e| CoreError::State(e.to_string()))
+    }
+
     fn add_genie_code(&mut self, code: &str) -> Result<(), CoreError> {
         self.deck
             .add_genie_code(code.to_string())
@@ -298,6 +316,27 @@ mod tests {
         core.add_genie_code("SXIOPO").unwrap();
         assert!(core.add_genie_code("QQQQQQ").is_err());
         core.remove_genie_code("SXIOPO");
+        core.clock_frame().unwrap();
+    }
+
+    /// Raw snapshots round-trip through the fixed-length buffer API used
+    /// by rewind, and the length stays fixed for the loaded cart.
+    #[test]
+    fn raw_state_snapshot_roundtrip() {
+        let mut core = TetanesCore::new();
+        core.load_rom("synthetic", &synthetic_rom()).unwrap();
+        core.clock_frame().unwrap();
+
+        let len = core.state_len().unwrap();
+        let mut buf = vec![0u8; len];
+        let written = core.serialize_state(&mut buf).unwrap();
+        assert!(written > 0 && written <= len);
+
+        for _ in 0..3 {
+            core.clock_frame().unwrap();
+        }
+        assert_eq!(core.state_len().unwrap(), len);
+        core.deserialize_state(&buf).unwrap();
         core.clock_frame().unwrap();
     }
 

@@ -27,7 +27,7 @@ pub enum CoreError {
     #[error("即时存档操作失败: {0}")]
     State(String),
     /// A Game Genie cheat code was rejected.
-    #[error("金手指码无效: {0}")]
+    #[error("作弊码无效: {0}")]
     Genie(String),
 }
 
@@ -90,6 +90,20 @@ pub trait NesCore {
     /// Restores a state previously produced by
     /// [`save_state`](NesCore::save_state) for the same ROM.
     fn load_state(&mut self, data: &[u8]) -> Result<(), CoreError>;
+
+    /// Fixed byte length of a serialized state for the loaded ROM, for
+    /// sizing reusable snapshot buffers once per session.
+    fn state_len(&self) -> Result<usize, CoreError>;
+
+    /// Serializes the console state into `dst` without allocating; `dst`
+    /// must hold at least [`state_len`](NesCore::state_len) bytes. Returns
+    /// the bytes written. Suited to high-frequency rewind snapshots.
+    fn serialize_state(&self, dst: &mut [u8]) -> Result<usize, CoreError>;
+
+    /// Restores a state written by
+    /// [`serialize_state`](NesCore::serialize_state) for the same ROM;
+    /// trailing bytes in `src` are ignored.
+    fn deserialize_state(&mut self, src: &[u8]) -> Result<(), CoreError>;
 
     /// Applies a Game Genie cheat code to the running console.
     fn add_genie_code(&mut self, code: &str) -> Result<(), CoreError>;

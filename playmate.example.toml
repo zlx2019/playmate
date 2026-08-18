@@ -49,7 +49,7 @@ turbo_a = "Numpad2"
 # [video]
 # ntsc_filter = true    # NTSC 柔化滤镜（CRT 观感，默认开）；false = 锐利点阵
 
-# 金手指（Game Genie 码，按游戏名分组；游戏内暂停菜单可视化管理）：
+# 作弊码（Game Genie 金手指码，按游戏名分组；游戏内暂停菜单可视化管理）：
 # 码为 6 或 8 位字母，与 ROM 版本（美版/日版）相关。
 # [[cheats."Super Mario Bros"]]
 # code = "SXIOPO"     # 无限命
