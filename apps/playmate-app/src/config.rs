@@ -25,6 +25,9 @@ pub struct Config {
     /// Game Genie cheat codes per game, keyed by ROM title.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cheats: BTreeMap<String, Vec<CheatEntry>>,
+    /// Most recently played local ROM, offered as quick resume on the main menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_game: Option<PathBuf>,
 }
 
 /// One Game Genie cheat entry for a game.

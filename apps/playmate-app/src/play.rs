@@ -15,7 +15,7 @@ use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
 use crate::config::{self, InputMap};
-use crate::emu::{self, CheatCmd, NetSink, SharedState};
+use crate::emu::{self, CheatCmd, NetSink, SharedState, StatePaths};
 use crate::gamepad::GamepadInput;
 
 /// How long a save/load result toast stays on screen.
@@ -62,7 +62,14 @@ impl PlaySession {
     /// Loads a ROM for local play and starts emulation and audio.
     /// `cheats` holds the game's enabled Game Genie codes.
     pub fn start(rom_path: &Path, cheats: &[String]) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, None, cheats)
+        Self::start_with(rom_path, None, cheats, false)
+    }
+
+    /// Like [`start`](Self::start), but restores the auto snapshot written
+    /// when the previous session of this game ended. A missing or unreadable
+    /// snapshot degrades to a fresh start.
+    pub fn resume(rom_path: &Path, cheats: &[String]) -> anyhow::Result<Self> {
+        Self::start_with(rom_path, None, cheats, true)
     }
 
     /// Starts host-mode netplay, using `local_slot` locally and sending media through `sink`.
@@ -72,7 +79,7 @@ impl PlaySession {
         sink: NetSink,
         cheats: &[String],
     ) -> anyhow::Result<Self> {
-        Self::start_with(rom_path, Some((local_slot, sink)), cheats)
+        Self::start_with(rom_path, Some((local_slot, sink)), cheats, false)
     }
 
     /// Shared startup path.
@@ -80,6 +87,7 @@ impl PlaySession {
         rom_path: &Path,
         net: Option<(Player, NetSink)>,
         cheats: &[String],
+        resume: bool,
     ) -> anyhow::Result<Self> {
         let rom_bytes = std::fs::read(rom_path)
             .with_context(|| format!("无法读取 ROM 文件: {}", rom_path.display()))?;
@@ -110,11 +118,31 @@ impl PlaySession {
             Some((slot, sink)) => (Some(slot), Some(sink)),
             None => (None, None),
         };
-        let state_path = saves_dir.join(format!("{rom_title}.state"));
+        let paths = StatePaths {
+            manual: saves_dir.join(format!("{rom_title}.state")),
+            auto: saves_dir.join(format!("{rom_title}.auto.state")),
+        };
+
+        // Quick resume: restore the snapshot from the previous session end.
+        if resume {
+            match std::fs::read(&paths.auto) {
+                Ok(data) => match core.load_state(&data) {
+                    Ok(()) => {
+                        // The snapshot carries the previous session's APU
+                        // sample rate; the current device may differ.
+                        core.set_sample_rate(sample_rate as f32);
+                        log::info!("resumed from auto state {:?}", paths.auto);
+                    }
+                    Err(e) => log::warn!("ignoring unreadable auto state: {e}"),
+                },
+                Err(e) => log::info!("no auto state ({e}); starting fresh"),
+            }
+        }
+
         let shared = Arc::new(SharedState::new());
         let emu_shared = Arc::clone(&shared);
         let emu_handle = std::thread::spawn(move || {
-            emu::run_emulation(core, emu_shared, ring, net_sink, Some(state_path));
+            emu::run_emulation(core, emu_shared, ring, net_sink, Some(paths));
         });
 
         log::info!("game started: {rom_title}");

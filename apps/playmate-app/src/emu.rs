@@ -23,6 +23,14 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 /// crash; a final write also happens when the session ends.
 const SRAM_AUTOSAVE: Duration = Duration::from_secs(60);
 
+/// Instant-state file locations for one game.
+pub struct StatePaths {
+    /// Manual slot written through the pause menu or F5.
+    pub manual: PathBuf,
+    /// Auto snapshot written when the session ends, enabling quick resume.
+    pub auto: PathBuf,
+}
+
 /// Cheat mutation requested by the UI and served by the emulation thread.
 pub enum CheatCmd {
     /// Apply a Game Genie code, already validated by the UI.
@@ -90,7 +98,7 @@ pub fn run_emulation(
     shared: Arc<SharedState>,
     ring: Arc<AudioRing>,
     net: Option<NetSink>,
-    state_path: Option<PathBuf>,
+    paths: Option<StatePaths>,
 ) {
     let frame_dur = Duration::from_secs_f64(1.0 / NTSC_FPS);
     let mut next = Instant::now() + frame_dur;
@@ -100,7 +108,11 @@ pub fn run_emulation(
     while shared.running.load(Ordering::Relaxed) {
         // 0. Serve instant save/load and cheat requests before the pause
         // check, so the pause-menu actions work while local play is paused.
-        handle_state_requests(&mut core, &shared, state_path.as_deref());
+        handle_state_requests(
+            &mut core,
+            &shared,
+            paths.as_ref().map(|p| p.manual.as_path()),
+        );
         handle_cheat_cmds(&mut core, &shared);
 
         // 1. Paused (local play): idle without stepping and hold the frame
@@ -170,6 +182,12 @@ pub fn run_emulation(
     // Final SRAM write so battery-backed progress survives closing the game.
     if let Err(e) = core.persist_sram() {
         log::error!("failed to save battery SRAM on exit: {e}");
+    }
+    // Auto-resume snapshot, loaded by the main menu's continue entry.
+    if let Some(paths) = &paths
+        && let Err(e) = save_state_file(&mut core, &paths.auto)
+    {
+        log::warn!("failed to write auto-resume state: {e}");
     }
     log::info!("emulation thread exited");
 }

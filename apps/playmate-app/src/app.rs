@@ -180,25 +180,57 @@ impl PlaymateApp {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let mut nav = Nav::Stay;
         match &mut self.page {
-            Page::MainMenu => match main_menu::show(ui) {
-                MenuAction::None => {}
-                MenuAction::SinglePlayer => {
-                    nav = Nav::To(Box::new(Page::GameSelect {
-                        games: game_select::scan_roms(),
-                        error: None,
-                    }));
+            Page::MainMenu => {
+                // Offer quick resume only while the recorded ROM still exists.
+                let resume_title = self
+                    .cfg
+                    .last_game
+                    .as_deref()
+                    .filter(|p| p.is_file())
+                    .and_then(|p| p.file_stem())
+                    .map(|n| n.to_string_lossy().into_owned());
+                match main_menu::show(ui, resume_title.as_deref()) {
+                    MenuAction::None => {}
+                    MenuAction::Continue => {
+                        if let Some(path) = self.cfg.last_game.clone() {
+                            let title = resume_title.unwrap_or_default();
+                            let cheats = self.cfg.enabled_cheats(&title);
+                            match PlaySession::resume(&path, &cheats) {
+                                Ok(session) => {
+                                    nav = Nav::To(Box::new(Page::Playing {
+                                        session,
+                                        net: None,
+                                        menu: GameMenu::default(),
+                                    }));
+                                }
+                                // Report the failure where an error slot exists.
+                                Err(e) => {
+                                    nav = Nav::To(Box::new(Page::GameSelect {
+                                        games: game_select::scan_roms(),
+                                        error: Some(format!("继续游戏失败: {e:#}")),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    MenuAction::SinglePlayer => {
+                        nav = Nav::To(Box::new(Page::GameSelect {
+                            games: game_select::scan_roms(),
+                            error: None,
+                        }));
+                    }
+                    MenuAction::LanPlay => {
+                        nav = Nav::To(Box::new(Page::LanLobby {
+                            state: LobbyState::new(),
+                        }));
+                    }
+                    MenuAction::Settings => {
+                        nav = Nav::To(Box::new(Page::Settings {
+                            state: SettingsState::default(),
+                        }));
+                    }
                 }
-                MenuAction::LanPlay => {
-                    nav = Nav::To(Box::new(Page::LanLobby {
-                        state: LobbyState::new(),
-                    }));
-                }
-                MenuAction::Settings => {
-                    nav = Nav::To(Box::new(Page::Settings {
-                        state: SettingsState::default(),
-                    }));
-                }
-            },
+            }
             Page::GameSelect { games, error } => {
                 match game_select::show(ui, games, error.as_deref()) {
                     GameSelectAction::None => {}
@@ -213,6 +245,11 @@ impl PlaymateApp {
                         let cheats = self.cfg.enabled_cheats(&title);
                         match PlaySession::start(&path, &cheats) {
                             Ok(session) => {
+                                // Remember the game for the main menu's quick resume.
+                                self.cfg.last_game = Some(path);
+                                if let Err(e) = config::save(&mut self.cfg) {
+                                    log::warn!("failed to save last game: {e:#}");
+                                }
                                 nav = Nav::To(Box::new(Page::Playing {
                                     session,
                                     net: None,

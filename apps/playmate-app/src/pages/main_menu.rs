@@ -9,6 +9,8 @@ use crate::theme;
 pub enum MenuAction {
     /// No action.
     None,
+    /// Resume the most recently played local game from its auto snapshot.
+    Continue,
     /// Enter local game selection.
     SinglePlayer,
     /// Enter the LAN lobby.
@@ -21,7 +23,8 @@ pub enum MenuAction {
 const MENU_WIDTH: f32 = 360.0;
 
 /// Draws the main menu and returns the current frame's action.
-pub fn show(ui: &mut egui::Ui) -> MenuAction {
+/// `resume_title` shows a quick-resume row for the last played game.
+pub fn show(ui: &mut egui::Ui, resume_title: Option<&str>) -> MenuAction {
     let mut action = MenuAction::None;
     egui::CentralPanel::default().show(ui, |ui| {
         let top = (ui.available_height() * 0.14).max(24.0);
@@ -51,6 +54,11 @@ pub fn show(ui: &mut egui::Ui) -> MenuAction {
             ui.scope(|ui| {
                 ui.set_max_width(MENU_WIDTH);
                 ui.spacing_mut().item_spacing.y = 12.0;
+                if let Some(title) = resume_title
+                    && theme::card_row(ui, "▶", "继续游戏", Some(title), true).clicked()
+                {
+                    action = MenuAction::Continue;
+                }
                 if theme::card_row(ui, "🎮", "单机游戏", None, true).clicked() {
                     action = MenuAction::SinglePlayer;
                 }
