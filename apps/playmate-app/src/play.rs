@@ -7,15 +7,19 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use playmate_core::{ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, TetanesCore};
 use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
-use crate::config::InputMap;
+use crate::config::{self, InputMap};
 use crate::emu::{self, NetSink, SharedState};
 use crate::gamepad::GamepadInput;
+
+/// How long a save/load result toast stays on screen.
+const TOAST_DURATION: Duration = Duration::from_millis(2500);
 
 /// A running game session.
 pub struct PlaySession {
@@ -36,6 +40,8 @@ pub struct PlaySession {
     /// Local player's slot in netplay. When set, local input writes only this
     /// slot and the network task writes the remote slot. `None` means local play.
     net_local_slot: Option<Player>,
+    /// Active save/load result toast with its display start time.
+    toast: Option<(String, Instant)>,
 }
 
 impl PlaySession {
@@ -62,7 +68,10 @@ impl PlaySession {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| rom_path.display().to_string());
 
-        let mut core = TetanesCore::new();
+        // Battery saves live in the saves directory; loading the ROM restores
+        // its .sram file automatically when one exists.
+        let saves_dir = config::saves_dir();
+        let mut core = TetanesCore::with_sram_dir(Some(saves_dir.clone()));
         core.load_rom(&rom_title, &rom_bytes)
             .with_context(|| format!("加载 ROM 失败: {rom_title}"))?;
 
@@ -74,10 +83,12 @@ impl PlaySession {
             Some((slot, sink)) => (Some(slot), Some(sink)),
             None => (None, None),
         };
+        let state_path = saves_dir.join(format!("{rom_title}.state"));
         let shared = Arc::new(SharedState::new());
         let emu_shared = Arc::clone(&shared);
-        let emu_handle =
-            std::thread::spawn(move || emu::run_emulation(core, emu_shared, ring, net_sink));
+        let emu_handle = std::thread::spawn(move || {
+            emu::run_emulation(core, emu_shared, ring, net_sink, Some(state_path));
+        });
 
         log::info!("game started: {rom_title}");
         Ok(Self {
@@ -89,6 +100,7 @@ impl PlaySession {
             texture: None,
             keyboard: [ButtonState::empty(); 2],
             net_local_slot,
+            toast: None,
         })
     }
 
@@ -155,6 +167,16 @@ impl PlaySession {
         self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
+    /// Requests an instant state save, served by the emulation thread.
+    pub fn request_save_state(&self) {
+        self.shared.save_state_req.store(true, Ordering::Relaxed);
+    }
+
+    /// Requests restoring the instant save state, served by the emulation thread.
+    pub fn request_load_state(&self) {
+        self.shared.load_state_req.store(true, Ordering::Relaxed);
+    }
+
     /// Returns the shared input cell for a player slot.
     fn buttons_cell(&self, player: Player) -> &std::sync::atomic::AtomicU8 {
         match player {
@@ -163,12 +185,41 @@ impl PlaySession {
         }
     }
 
-    /// Draws the game frame.
+    /// Draws the game frame and any transient save/load result toast.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let Ok(fb) = self.shared.framebuffer.lock() else {
+        if let Ok(fb) = self.shared.framebuffer.lock() {
+            render_frame_texture(ui, &mut self.texture, &fb);
+        }
+        self.show_toast(ui.ctx());
+    }
+
+    /// Picks up the latest emulation status message and draws it above the
+    /// frame for a short time.
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        if let Ok(mut status) = self.shared.status.lock()
+            && let Some(msg) = status.take()
+        {
+            self.toast = Some((msg, Instant::now()));
+        }
+        let Some((msg, since)) = &self.toast else {
             return;
         };
-        render_frame_texture(ui, &mut self.texture, &fb);
+        if since.elapsed() >= TOAST_DURATION {
+            self.toast = None;
+            return;
+        }
+        egui::Area::new(egui::Id::new("emu-status-toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -48.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(msg).strong());
+                });
+            });
+        // Keep repainting while the toast is visible so it expires even when
+        // the game is paused and nothing else triggers a redraw.
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 

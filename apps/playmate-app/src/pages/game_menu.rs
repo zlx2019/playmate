@@ -22,6 +22,10 @@ pub enum GameMenuAction {
     None,
     /// Close the overlay and resume gameplay.
     Resume,
+    /// Save an instant state; only offered while running the emulator locally.
+    SaveState,
+    /// Restore the instant state; only offered while running the emulator locally.
+    LoadState,
     /// End the game session.
     Exit,
     /// Restore default key bindings; handled by the application.
@@ -30,7 +34,15 @@ pub enum GameMenuAction {
 
 /// Draws the dimmed backdrop and the centered overlay. Call only while open.
 /// `paused` selects the title: local play pauses, netplay only shows the menu.
-pub fn show(ui: &mut egui::Ui, cfg: &Config, menu: &mut GameMenu, paused: bool) -> GameMenuAction {
+/// `can_save` offers instant save/load, available only where the emulator
+/// runs locally (single-player or netplay host, never a guest).
+pub fn show(
+    ui: &mut egui::Ui,
+    cfg: &Config,
+    menu: &mut GameMenu,
+    paused: bool,
+    can_save: bool,
+) -> GameMenuAction {
     let mut action = GameMenuAction::None;
     // Dim the game frame; the floating window renders above this paint.
     ui.painter().rect_filled(
@@ -60,6 +72,16 @@ pub fn show(ui: &mut egui::Ui, cfg: &Config, menu: &mut GameMenu, paused: bool) 
                 ui.add_space(4.0);
                 if menu_button(ui, "▶ 继续游戏").clicked() {
                     action = GameMenuAction::Resume;
+                }
+                if can_save {
+                    ui.add_space(4.0);
+                    if menu_button(ui, "存档 (F5)").clicked() {
+                        action = GameMenuAction::SaveState;
+                    }
+                    ui.add_space(4.0);
+                    if menu_button(ui, "读档 (F9)").clicked() {
+                        action = GameMenuAction::LoadState;
+                    }
                 }
                 ui.add_space(4.0);
                 if menu_button(ui, "⚙ 设置").clicked() {

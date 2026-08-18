@@ -238,6 +238,20 @@ pub fn ensure_data_dirs() {
     }
 }
 
+/// Directory for battery saves and instant save states, following the same
+/// portable-versus-user-directory rule as the configuration file: a local
+/// `playmate.toml` keeps saves next to it, otherwise they go to the user
+/// data directory.
+pub fn saves_dir() -> PathBuf {
+    if PathBuf::from(CONFIG_FILE).exists() {
+        return PathBuf::from("saves");
+    }
+    match data_dir() {
+        Some(dir) => dir.join("saves"),
+        None => PathBuf::from("saves"),
+    }
+}
+
 /// Configuration path: use an existing local `playmate.toml` for portable or
 /// development setups; otherwise use the platform user-data directory.
 fn config_path() -> PathBuf {

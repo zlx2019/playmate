@@ -20,6 +20,12 @@ pub enum CoreError {
     /// Advancing the emulation failed.
     #[error("模拟执行出错: {0}")]
     Clock(String),
+    /// Persisting battery-backed SRAM failed.
+    #[error("电池存档保存失败: {0}")]
+    Sram(String),
+    /// Saving or restoring an instant state failed.
+    #[error("即时存档操作失败: {0}")]
+    State(String),
 }
 
 /// Common interface for an NES emulation core.
@@ -54,4 +60,20 @@ pub trait NesCore {
 
     /// Performs a soft reset, equivalent to pressing Reset on the console.
     fn reset(&mut self);
+
+    /// Returns whether the loaded cartridge has battery-backed SRAM.
+    fn battery_backed(&self) -> bool;
+
+    /// Writes battery-backed SRAM to its backing file. A no-op for a
+    /// cartridge without a battery or a core without a configured save
+    /// directory. Call periodically and once before dropping the core, since
+    /// nothing persists SRAM automatically while the game runs.
+    fn persist_sram(&mut self) -> Result<(), CoreError>;
+
+    /// Serializes the complete console state for an instant save.
+    fn save_state(&mut self) -> Result<Vec<u8>, CoreError>;
+
+    /// Restores a state previously produced by
+    /// [`save_state`](NesCore::save_state) for the same ROM.
+    fn load_state(&mut self, data: &[u8]) -> Result<(), CoreError>;
 }

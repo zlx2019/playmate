@@ -253,9 +253,23 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
-                    match game_menu::show(ui, &self.cfg, menu, net.is_none()) {
+                    match game_menu::show(ui, &self.cfg, menu, net.is_none(), true) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
+                            menu.open = false;
+                            menu.settings = None;
+                            session.set_paused(false);
+                        }
+                        // Save/load close the menu so the result toast and the
+                        // (possibly restored) frame are immediately visible.
+                        GameMenuAction::SaveState => {
+                            session.request_save_state();
+                            menu.open = false;
+                            menu.settings = None;
+                            session.set_paused(false);
+                        }
+                        GameMenuAction::LoadState => {
+                            session.request_load_state();
                             menu.open = false;
                             menu.settings = None;
                             session.set_paused(false);
@@ -322,12 +336,14 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(ui, &self.cfg, menu, false) {
+                    match game_menu::show(ui, &self.cfg, menu, false, false) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
                             menu.settings = None;
                         }
+                        // Guests never see save/load; the emulator is not local.
+                        GameMenuAction::SaveState | GameMenuAction::LoadState => {}
                         GameMenuAction::Exit => leave = true,
                         GameMenuAction::RestoreDefaults => restore_default_keys(
                             &mut self.cfg,
@@ -774,6 +790,17 @@ impl ApplicationHandler for PlaymateApp {
                     Page::Playing { session, .. } => {
                         if code == KeyCode::Escape {
                             toggle_menu = toggle;
+                            consumed_by_game = true;
+                        } else if code == KeyCode::F5 {
+                            // Instant save/load hotkeys, host-side only.
+                            if toggle {
+                                session.request_save_state();
+                            }
+                            consumed_by_game = true;
+                        } else if code == KeyCode::F9 {
+                            if toggle {
+                                session.request_load_state();
+                            }
                             consumed_by_game = true;
                         } else {
                             consumed_by_game = session.on_key(&self.input_map, code, pressed);
