@@ -299,6 +299,11 @@ impl PlaymateApp {
                     session.set_paused(net.is_none());
                 }
                 if menu.open {
+                    let slots_used = [
+                        session.slot_used(1),
+                        session.slot_used(2),
+                        session.slot_used(3),
+                    ];
                     match game_menu::show(
                         ui,
                         &self.cfg,
@@ -306,6 +311,7 @@ impl PlaymateApp {
                         net.is_none(),
                         true,
                         &session.rom_title,
+                        slots_used,
                     ) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
@@ -316,15 +322,15 @@ impl PlaymateApp {
                         }
                         // Save/load close the menu so the result toast and the
                         // (possibly restored) frame are immediately visible.
-                        GameMenuAction::SaveState => {
-                            session.request_save_state();
+                        GameMenuAction::SaveState(slot) => {
+                            session.request_save_state(slot);
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
                             session.set_paused(false);
                         }
-                        GameMenuAction::LoadState => {
-                            session.request_load_state();
+                        GameMenuAction::LoadState(slot) => {
+                            session.request_load_state(slot);
                             menu.open = false;
                             menu.settings = None;
                             menu.cheats = None;
@@ -465,7 +471,15 @@ impl PlaymateApp {
                 }
                 if menu.open {
                     // Clients cannot pause the host's game; the menu only overlays it.
-                    match game_menu::show(ui, &self.cfg, menu, false, false, &play.rom_title) {
+                    match game_menu::show(
+                        ui,
+                        &self.cfg,
+                        menu,
+                        false,
+                        false,
+                        &play.rom_title,
+                        [false; 3],
+                    ) {
                         GameMenuAction::None => {}
                         GameMenuAction::Resume => {
                             menu.open = false;
@@ -473,8 +487,8 @@ impl PlaymateApp {
                             menu.cheats = None;
                         }
                         // Guests never see save/load or cheats; the emulator is not local.
-                        GameMenuAction::SaveState
-                        | GameMenuAction::LoadState
+                        GameMenuAction::SaveState(_)
+                        | GameMenuAction::LoadState(_)
                         | GameMenuAction::AddCheat(_)
                         | GameMenuAction::ToggleCheat(_)
                         | GameMenuAction::RemoveCheat(_) => {}
@@ -953,12 +967,12 @@ impl ApplicationHandler for PlaymateApp {
                         } else if code == KeyCode::F5 {
                             // Instant save/load hotkeys, host-side only.
                             if toggle {
-                                session.request_save_state();
+                                session.request_save_state(1);
                             }
                             consumed_by_game = true;
                         } else if code == KeyCode::F9 {
                             if toggle {
-                                session.request_load_state();
+                                session.request_load_state(1);
                             }
                             consumed_by_game = true;
                         } else {

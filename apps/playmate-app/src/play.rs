@@ -15,7 +15,7 @@ use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
 use crate::config::{self, Config, InputMap};
-use crate::emu::{self, CheatCmd, NetSink, SharedState, StatePaths};
+use crate::emu::{self, CheatCmd, NetSink, STATE_SLOTS, SharedState, StatePaths};
 use crate::gamepad::GamepadInput;
 
 /// How long a save/load result toast stays on screen.
@@ -54,6 +54,8 @@ pub struct PlaySession {
     /// Local player's slot in netplay. When set, local input writes only this
     /// slot and the network task writes the remote slot. `None` means local play.
     net_local_slot: Option<Player>,
+    /// Manual state-slot files, kept for the pause menu's occupancy markers.
+    state_slots: [std::path::PathBuf; STATE_SLOTS],
     /// Active save/load result toast with its display start time.
     toast: Option<(String, Instant)>,
 }
@@ -118,10 +120,16 @@ impl PlaySession {
             Some((slot, sink)) => (Some(slot), Some(sink)),
             None => (None, None),
         };
+        // Slot 1 keeps the pre-multi-slot file name for compatibility.
         let paths = StatePaths {
-            manual: saves_dir.join(format!("{rom_title}.state")),
+            slots: [
+                saves_dir.join(format!("{rom_title}.state")),
+                saves_dir.join(format!("{rom_title}.slot2.state")),
+                saves_dir.join(format!("{rom_title}.slot3.state")),
+            ],
             auto: saves_dir.join(format!("{rom_title}.auto.state")),
         };
+        let state_slots = paths.slots.clone();
 
         // Quick resume: restore the snapshot from the previous session end.
         if resume {
@@ -160,6 +168,7 @@ impl PlaySession {
             turbo: [ButtonState::empty(); 2],
             started: Instant::now(),
             net_local_slot,
+            state_slots,
             toast: None,
         })
     }
@@ -271,14 +280,27 @@ impl PlaySession {
         self.shared.ntsc_filter.store(enabled, Ordering::Relaxed);
     }
 
-    /// Requests an instant state save, served by the emulation thread.
-    pub fn request_save_state(&self) {
-        self.shared.save_state_req.store(true, Ordering::Relaxed);
+    /// Requests an instant state save into a one-based slot,
+    /// served by the emulation thread.
+    pub fn request_save_state(&self, slot: u8) {
+        self.shared
+            .save_state_req
+            .store(slot.clamp(1, STATE_SLOTS as u8), Ordering::Relaxed);
     }
 
-    /// Requests restoring the instant save state, served by the emulation thread.
-    pub fn request_load_state(&self) {
-        self.shared.load_state_req.store(true, Ordering::Relaxed);
+    /// Requests restoring a one-based slot, served by the emulation thread.
+    pub fn request_load_state(&self, slot: u8) {
+        self.shared
+            .load_state_req
+            .store(slot.clamp(1, STATE_SLOTS as u8), Ordering::Relaxed);
+    }
+
+    /// Whether a manual slot already holds a saved state, for menu markers.
+    pub fn slot_used(&self, slot: u8) -> bool {
+        usize::from(slot)
+            .checked_sub(1)
+            .and_then(|i| self.state_slots.get(i))
+            .is_some_and(|p| p.is_file())
     }
 
     /// Returns the shared input cell for a player slot.

@@ -34,10 +34,12 @@ pub enum GameMenuAction {
     None,
     /// Close the overlay and resume gameplay.
     Resume,
-    /// Save an instant state; only offered while running the emulator locally.
-    SaveState,
-    /// Restore the instant state; only offered while running the emulator locally.
-    LoadState,
+    /// Save an instant state into this one-based slot; only offered while
+    /// running the emulator locally.
+    SaveState(u8),
+    /// Restore the instant state of this one-based slot; only offered while
+    /// running the emulator locally.
+    LoadState(u8),
     /// Add the typed Game Genie code; the application validates and persists it.
     AddCheat(String),
     /// Flip the enabled flag of the cheat at this index.
@@ -56,7 +58,8 @@ pub enum GameMenuAction {
 /// `paused` selects the title: local play pauses, netplay only shows the menu.
 /// `can_save` offers instant save/load and cheats, available only where the
 /// emulator runs locally (single-player or netplay host, never a guest).
-/// `rom_title` keys the cheat list inside `cfg`.
+/// `rom_title` keys the cheat list inside `cfg`; `slots_used` marks the
+/// occupied state slots.
 pub fn show(
     ui: &mut egui::Ui,
     cfg: &Config,
@@ -64,6 +67,7 @@ pub fn show(
     paused: bool,
     can_save: bool,
     rom_title: &str,
+    slots_used: [bool; 3],
 ) -> GameMenuAction {
     let mut action = GameMenuAction::None;
     // Dim the game frame; the floating window renders above this paint.
@@ -104,12 +108,12 @@ pub fn show(
                 }
                 if can_save {
                     ui.add_space(4.0);
-                    if menu_button(ui, "存档 (F5)").clicked() {
-                        action = GameMenuAction::SaveState;
+                    if let Some(slot) = slot_row(ui, "存档 (F5)", slots_used) {
+                        action = GameMenuAction::SaveState(slot);
                     }
                     ui.add_space(4.0);
-                    if menu_button(ui, "读档 (F9)").clicked() {
-                        action = GameMenuAction::LoadState;
+                    if let Some(slot) = slot_row(ui, "读档 (F9)", slots_used) {
+                        action = GameMenuAction::LoadState(slot);
                     }
                     ui.add_space(4.0);
                     if menu_button(ui, "金手指").clicked() {
@@ -209,4 +213,28 @@ fn cheats_view(
 /// Full-width overlay button.
 fn menu_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized([ui.available_width(), 34.0], egui::Button::new(text))
+}
+
+/// Menu row with a label and one button per state slot; occupied slots are
+/// tinted green. Returns the clicked one-based slot.
+fn slot_row(ui: &mut egui::Ui, label: &str, slots_used: [bool; 3]) -> Option<u8> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.add_sized([96.0, 34.0], egui::Label::new(label));
+        for (i, used) in slots_used.iter().enumerate() {
+            let text = egui::RichText::new(format!("{}", i + 1)).strong();
+            let text = if *used {
+                text.color(theme::GREEN)
+            } else {
+                text
+            };
+            if ui
+                .add_sized([34.0, 34.0], egui::Button::new(text))
+                .clicked()
+            {
+                clicked = Some(i as u8 + 1);
+            }
+        }
+    });
+    clicked
 }
