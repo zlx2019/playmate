@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use tetanes_core::{
     common::ResetKind,
-    control_deck::{Config, ControlDeck},
+    control_deck::{Clocked, Config, ControlDeck},
     input::{JoypadBtn, Player as TetanesPlayer},
 };
 
@@ -84,10 +84,16 @@ impl NesCore for TetanesCore {
     }
 
     fn clock_frame(&mut self) -> Result<(), CoreError> {
-        self.deck
-            .clock_frame()
-            .map(|_| ())
-            .map_err(|e| CoreError::Clock(e.to_string()))
+        // At speeds above 1x the deck owes several NES frames per display
+        // frame and hands them out one call at a time; drain them here so one
+        // call always advances one full display frame.
+        loop {
+            match self.deck.clock_frame() {
+                Ok(Clocked::Continue) => {}
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(CoreError::Clock(e.to_string())),
+            }
+        }
     }
 
     fn set_player_input(&mut self, player: Player, state: ButtonState) {
@@ -112,6 +118,10 @@ impl NesCore for TetanesCore {
 
     fn set_sample_rate(&mut self, rate: f32) {
         self.deck.set_sample_rate(rate);
+    }
+
+    fn set_frame_speed(&mut self, speed: f32) {
+        self.deck.set_frame_speed(speed);
     }
 
     fn reset(&mut self) {

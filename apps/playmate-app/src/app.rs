@@ -34,6 +34,9 @@ use crate::play::{GuestPlay, PlaySession};
 // Matches theme background #141417 after converting sRGB to wgpu's linear color space.
 const CLEAR_COLOR: [f32; 4] = [0.007, 0.007, 0.0085, 1.0];
 
+/// Fast-forward speed multiplier while the hold key (Tab) is down.
+const FF_SPEED: u8 = 4;
+
 /// Current page, with each variant carrying its private state.
 pub enum Page {
     /// Main menu.
@@ -229,6 +232,12 @@ impl PlaymateApp {
                             open_menu = true;
                         }
                         ui.label(egui::RichText::new(&session.rom_title).strong());
+                        if session.is_fast_forward() {
+                            ui.label(
+                                egui::RichText::new("▶▶ 4×")
+                                    .color(egui::Color32::from_rgb(222, 178, 88)),
+                            );
+                        }
                         if let Some(net_state) = net {
                             match &net_state.error {
                                 Some(err) => {
@@ -657,6 +666,9 @@ impl PlaymateApp {
                 menu.open = !menu.open;
                 if menu.open {
                     session.clear_input();
+                    // The menu swallows the Tab release, so drop fast-forward
+                    // now or it would stay engaged after resuming.
+                    session.set_speed(1);
                 } else {
                     menu.settings = None;
                 }
@@ -791,7 +803,7 @@ impl ApplicationHandler for PlaymateApp {
                 }
             } else {
                 match &mut self.page {
-                    Page::Playing { session, .. } => {
+                    Page::Playing { session, net, .. } => {
                         if code == KeyCode::Escape {
                             toggle_menu = toggle;
                             consumed_by_game = true;
@@ -808,6 +820,14 @@ impl ApplicationHandler for PlaymateApp {
                             consumed_by_game = true;
                         } else {
                             consumed_by_game = session.on_key(&self.input_map, code, pressed);
+                            // Unbound Tab is the fast-forward hold; netplay
+                            // cannot speed up because peers stream in real time.
+                            if !consumed_by_game && code == KeyCode::Tab {
+                                if net.is_none() {
+                                    session.set_speed(if pressed { FF_SPEED } else { 1 });
+                                }
+                                consumed_by_game = true;
+                            }
                         }
                     }
                     Page::GuestPlaying { play, .. } => {
@@ -816,6 +836,10 @@ impl ApplicationHandler for PlaymateApp {
                             consumed_by_game = true;
                         } else {
                             consumed_by_game = play.on_key(&self.input_map, code, pressed);
+                            // Swallow unbound Tab so it does not cycle egui focus mid-game.
+                            if !consumed_by_game && code == KeyCode::Tab {
+                                consumed_by_game = true;
+                            }
                         }
                     }
                     Page::Settings { .. } if pressed => {

@@ -58,6 +58,12 @@ pub trait NesCore {
     /// Sets the audio output sample rate in Hz; it must match the actual audio device.
     fn set_sample_rate(&mut self, rate: f32);
 
+    /// Sets the emulation speed multiplier (1.0 = normal). One
+    /// [`clock_frame`](NesCore::clock_frame) call still represents one display
+    /// frame; audio production is compensated so the per-second sample count
+    /// stays constant while sounding sped up.
+    fn set_frame_speed(&mut self, speed: f32);
+
     /// Performs a soft reset, equivalent to pressing Reset on the console.
     fn reset(&mut self);
 

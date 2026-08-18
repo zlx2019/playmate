@@ -41,6 +41,8 @@ pub struct SharedState {
     pub running: AtomicBool,
     /// Pause flag; the emulation thread idles without stepping while set.
     pub paused: AtomicBool,
+    /// Emulation speed multiplier; 1 is normal, larger values fast-forward.
+    pub speed: AtomicU8,
     /// One-shot request to write an instant save state.
     pub save_state_req: AtomicBool,
     /// One-shot request to restore the instant save state.
@@ -59,6 +61,7 @@ impl SharedState {
             p2_buttons: AtomicU8::new(0),
             running: AtomicBool::new(true),
             paused: AtomicBool::new(false),
+            speed: AtomicU8::new(1),
             save_state_req: AtomicBool::new(false),
             load_state_req: AtomicBool::new(false),
             status: Mutex::new(None),
@@ -81,6 +84,7 @@ pub fn run_emulation(
     let frame_dur = Duration::from_secs_f64(1.0 / NTSC_FPS);
     let mut next = Instant::now() + frame_dur;
     let mut last_sram_save = Instant::now();
+    let mut current_speed: u8 = 1;
 
     while shared.running.load(Ordering::Relaxed) {
         // 0. Serve instant save/load requests before the pause check, so the
@@ -93,6 +97,15 @@ pub fn run_emulation(
             thread::sleep(PAUSE_POLL);
             next = Instant::now() + frame_dur;
             continue;
+        }
+
+        // 1.5 Fast-forward: the core then advances several NES frames per
+        // clock_frame call below while the wall-clock cadence stays the same;
+        // audio output is compensated internally.
+        let speed = shared.speed.load(Ordering::Relaxed).max(1);
+        if speed != current_speed {
+            current_speed = speed;
+            core.set_frame_speed(f32::from(speed));
         }
 
         // 2. Replace both players' input with the latest state.

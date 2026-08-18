@@ -196,6 +196,18 @@ impl PlaySession {
         self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
+    /// Sets the emulation speed multiplier; 1 restores normal speed.
+    pub fn set_speed(&self, multiplier: u8) {
+        self.shared
+            .speed
+            .store(multiplier.max(1), Ordering::Relaxed);
+    }
+
+    /// Whether fast-forward is currently engaged.
+    pub fn is_fast_forward(&self) -> bool {
+        self.shared.speed.load(Ordering::Relaxed) > 1
+    }
+
     /// Requests an instant state save, served by the emulation thread.
     pub fn request_save_state(&self) {
         self.shared.save_state_req.store(true, Ordering::Relaxed);
