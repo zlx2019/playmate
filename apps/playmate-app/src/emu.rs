@@ -6,6 +6,7 @@
 //! - Video: a `Mutex<Vec<u8>>` containing the latest RGBA8 frame, written by
 //!   emulation and read by rendering.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,13 @@ const SRAM_AUTOSAVE: Duration = Duration::from_secs(60);
 
 /// Number of manual instant-state slots per game.
 pub const STATE_SLOTS: usize = 3;
+
+/// Frames between rewind snapshots: at 60 fps roughly 10 per second.
+const REWIND_INTERVAL_FRAMES: u32 = 6;
+
+/// Retained rewind snapshots; with the capture interval this covers about
+/// 30 seconds of play.
+const REWIND_CAPACITY: usize = 300;
 
 /// Save-state thumbnail width: half the NES frame, nearest-sampled.
 pub const THUMB_WIDTH: usize = 128;
@@ -46,6 +54,98 @@ pub enum CheatCmd {
     Add(String),
     /// Remove an applied Game Genie code.
     Remove(String),
+}
+
+/// Ring of recent state snapshots powering hold-to-rewind. Buffers are
+/// sized once from the cart's fixed state length and recycled, so the
+/// steady state performs no allocation.
+struct RewindBuffer {
+    /// Snapshots ordered oldest to newest.
+    snaps: VecDeque<Vec<u8>>,
+    /// Recycled buffers awaiting reuse.
+    spare: Vec<Vec<u8>>,
+    /// Frames until the next capture or restore step.
+    countdown: u32,
+    /// Set after a snapshot failure; rewind stays off for the session.
+    disabled: bool,
+}
+
+impl RewindBuffer {
+    /// Creates an empty ring; buffers are allocated lazily on first capture.
+    fn new() -> Self {
+        Self {
+            snaps: VecDeque::new(),
+            spare: Vec::new(),
+            countdown: 0,
+            disabled: false,
+        }
+    }
+
+    /// Captures a snapshot on the cadence; call once per emulated frame.
+    fn capture(&mut self, core: &impl NesCore) {
+        if self.disabled {
+            return;
+        }
+        if self.countdown > 0 {
+            self.countdown -= 1;
+            return;
+        }
+        self.countdown = REWIND_INTERVAL_FRAMES - 1;
+        let mut buf = if self.snaps.len() >= REWIND_CAPACITY {
+            self.snaps.pop_front().unwrap_or_default()
+        } else {
+            self.spare.pop().unwrap_or_default()
+        };
+        if buf.is_empty() {
+            match core.state_len() {
+                Ok(len) => buf.resize(len, 0),
+                Err(e) => {
+                    self.disable(&e);
+                    return;
+                }
+            }
+        }
+        match core.serialize_state(&mut buf) {
+            Ok(_) => self.snaps.push_back(buf),
+            Err(e) => {
+                self.spare.push(buf);
+                self.disable(&e);
+            }
+        }
+    }
+
+    /// Restores one snapshot on the cadence; call once per display frame
+    /// while rewinding. Returns whether the console state changed.
+    fn step_back(&mut self, core: &mut impl NesCore) -> bool {
+        if self.countdown > 0 {
+            self.countdown -= 1;
+            return false;
+        }
+        self.countdown = REWIND_INTERVAL_FRAMES - 1;
+        let Some(snap) = self.snaps.pop_back() else {
+            return false;
+        };
+        let restored = core.deserialize_state(&snap).is_ok();
+        self.spare.push(snap);
+        if restored {
+            // Serialized states carry no rendered frame, so clock one frame
+            // with no input to regenerate the picture; its audio is dropped.
+            core.set_player_input(Player::One, ButtonState::empty());
+            core.set_player_input(Player::Two, ButtonState::empty());
+            if core.clock_frame().is_err() {
+                return false;
+            }
+            core.clear_audio_samples();
+        }
+        restored
+    }
+
+    /// Turns rewind off for the session after a snapshot failure.
+    fn disable(&mut self, reason: &impl std::fmt::Display) {
+        self.disabled = true;
+        self.snaps.clear();
+        log::warn!("rewind disabled for this session: {reason}");
+    }
 }
 
 /// Media output channels from emulation to the network sender in host mode.
@@ -70,6 +170,8 @@ pub struct SharedState {
     pub speed: AtomicU8,
     /// Whether the NTSC composite filter is active (the tetanes default).
     pub ntsc_filter: AtomicBool,
+    /// Hold-to-rewind flag; the emulation thread rolls back while set.
+    pub rewinding: AtomicBool,
     /// One-shot request to write an instant save state; 0 = none, else the slot number.
     pub save_state_req: AtomicU8,
     /// One-shot request to restore an instant save state; 0 = none, else the slot number.
@@ -92,6 +194,7 @@ impl SharedState {
             paused: AtomicBool::new(false),
             speed: AtomicU8::new(1),
             ntsc_filter: AtomicBool::new(true),
+            rewinding: AtomicBool::new(false),
             save_state_req: AtomicU8::new(0),
             load_state_req: AtomicU8::new(0),
             status: Mutex::new(None),
@@ -118,6 +221,9 @@ pub fn run_emulation(
     let mut current_speed: u8 = 1;
     // Matches both the deck's and SharedState's initial filter.
     let mut current_ntsc = true;
+    // Rewind ring; only local play captures, so netplay hosting pays nothing.
+    let rewind_enabled = net.is_none();
+    let mut rewind = RewindBuffer::new();
 
     while shared.running.load(Ordering::Relaxed) {
         // 0. Serve instant save/load and cheat requests before the pause
@@ -130,6 +236,24 @@ pub fn run_emulation(
         if shared.paused.load(Ordering::Relaxed) {
             thread::sleep(PAUSE_POLL);
             next = Instant::now() + frame_dur;
+            continue;
+        }
+
+        // 1.4 Rewind: roll back through snapshots while held. Forward
+        // emulation, input, and audio stay suspended; the frame cadence and
+        // the capture cadence stay aligned so time reverses at play speed.
+        if rewind_enabled && shared.rewinding.load(Ordering::Relaxed) {
+            // Rewind always steps at 1x, even if fast-forward was engaged.
+            if current_speed != 1 {
+                current_speed = 1;
+                core.set_frame_speed(1.0);
+            }
+            if rewind.step_back(&mut core)
+                && let Ok(mut fb) = shared.framebuffer.lock()
+            {
+                fb.copy_from_slice(core.frame_buffer());
+            }
+            wait_next_frame(&mut next, frame_dur);
             continue;
         }
 
@@ -177,6 +301,11 @@ pub fn run_emulation(
         ring.push(core.audio_samples());
         core.clear_audio_samples();
 
+        // 5.5 Capture a rewind snapshot on its cadence (local play only).
+        if rewind_enabled {
+            rewind.capture(&core);
+        }
+
         // 6. Periodically flush battery SRAM; a no-op without a battery.
         if last_sram_save.elapsed() >= SRAM_AUTOSAVE {
             last_sram_save = Instant::now();
@@ -185,15 +314,8 @@ pub fn run_emulation(
             }
         }
 
-        // 7. Wait for the absolute next-frame deadline. Reset after a 250 ms lag,
-        // such as system sleep, to avoid an unbounded catch-up loop.
-        let now = Instant::now();
-        if next > now {
-            sleep_until(next);
-        } else if now.duration_since(next) > Duration::from_millis(250) {
-            next = now;
-        }
-        next += frame_dur;
+        // 7. Wait for the absolute next-frame deadline.
+        wait_next_frame(&mut next, frame_dur);
     }
 
     // Final SRAM write so battery-backed progress survives closing the game.
@@ -322,6 +444,19 @@ fn handle_cheat_cmds(core: &mut impl NesCore, shared: &SharedState) {
             CheatCmd::Remove(code) => core.remove_genie_code(&code),
         }
     }
+}
+
+/// Waits for the absolute next-frame deadline and advances it. The deadline
+/// resets after a 250 ms lag, such as system sleep, to avoid an unbounded
+/// catch-up loop.
+fn wait_next_frame(next: &mut Instant, frame_dur: Duration) {
+    let now = Instant::now();
+    if *next > now {
+        sleep_until(*next);
+    } else if now.duration_since(*next) > Duration::from_millis(250) {
+        *next = now;
+    }
+    *next += frame_dur;
 }
 
 /// Sleeps until `deadline` with sub-millisecond accuracy.

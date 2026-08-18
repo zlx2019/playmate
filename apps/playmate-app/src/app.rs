@@ -269,7 +269,12 @@ impl PlaymateApp {
                             open_menu = true;
                         }
                         ui.label(egui::RichText::new(&session.rom_title).strong());
-                        if session.is_fast_forward() {
+                        if session.is_rewinding() {
+                            ui.label(
+                                egui::RichText::new("↺ 回退")
+                                    .color(egui::Color32::from_rgb(222, 178, 88)),
+                            );
+                        } else if session.is_fast_forward() {
                             ui.label(
                                 egui::RichText::new("▶▶ 4×")
                                     .color(egui::Color32::from_rgb(222, 178, 88)),
@@ -345,7 +350,12 @@ impl PlaymateApp {
                         // The menu stays open so the cleared marker is visible.
                         GameMenuAction::DeleteState(slot) => session.delete_state(slot),
                         GameMenuAction::AddCheat(raw) => {
+                            // The underlying error text is technical English;
+                            // show one friendly reason instead of echoing it.
                             let (hint, added) = match playmate_core::validate_genie_code(&raw) {
+                                Err(_) => {
+                                    ("码无效：应为 6 或 8 位 Game Genie 字母".to_string(), false)
+                                }
                                 Ok(code) => {
                                     let list = self
                                         .cfg
@@ -366,13 +376,12 @@ impl PlaymateApp {
                                         ("已添加并生效".to_string(), true)
                                     }
                                 }
-                                Err(e) => (e.to_string(), false),
                             };
                             if let Some(state) = &mut menu.cheats {
                                 if added {
                                     state.input.clear();
                                 }
-                                state.hint = Some(hint);
+                                state.hint = Some((hint, added));
                             }
                         }
                         GameMenuAction::ToggleCheat(i) => {
@@ -825,9 +834,10 @@ impl PlaymateApp {
                 menu.open = !menu.open;
                 if menu.open {
                     session.clear_input();
-                    // The menu swallows the Tab release, so drop fast-forward
-                    // now or it would stay engaged after resuming.
+                    // The menu swallows the Tab/Backspace releases, so drop
+                    // fast-forward and rewind now or they would stay engaged.
                     session.set_speed(1);
+                    session.set_rewinding(false);
                 } else {
                     menu.settings = None;
                     menu.cheats = None;
@@ -988,6 +998,14 @@ impl ApplicationHandler for PlaymateApp {
                             if !consumed_by_game && code == KeyCode::Tab {
                                 if net.is_none() {
                                     session.set_speed(if pressed { FF_SPEED } else { 1 });
+                                }
+                                consumed_by_game = true;
+                            }
+                            // Unbound Backspace is the rewind hold; netplay
+                            // cannot roll a peer's timeline back.
+                            if !consumed_by_game && code == KeyCode::Backspace {
+                                if net.is_none() {
+                                    session.set_rewinding(pressed);
                                 }
                                 consumed_by_game = true;
                             }
