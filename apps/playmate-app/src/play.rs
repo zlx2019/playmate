@@ -21,6 +21,16 @@ use crate::gamepad::GamepadInput;
 /// How long a save/load result toast stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
 
+/// Turbo cadence half-period: 33 ms pressed, 33 ms released, roughly 15
+/// presses per second, which registers reliably with games polling input
+/// once per frame.
+const TURBO_HALF_PERIOD_MS: u128 = 33;
+
+/// Whether turbo-held buttons fire at this instant of the session clock.
+fn turbo_fire_on(since: Instant) -> bool {
+    (since.elapsed().as_millis() / TURBO_HALF_PERIOD_MS).is_multiple_of(2)
+}
+
 /// A running game session.
 pub struct PlaySession {
     /// Game title derived from the file name for display.
@@ -37,6 +47,10 @@ pub struct PlaySession {
     texture: Option<egui::TextureHandle>,
     /// Per-player keyboard bitmaps, maintained separately from gamepad input.
     keyboard: [ButtonState; 2],
+    /// Per-player keyboard turbo-held bitmaps, fired on the turbo cadence.
+    turbo: [ButtonState; 2],
+    /// Session clock driving the turbo cadence.
+    started: Instant,
     /// Local player's slot in netplay. When set, local input writes only this
     /// slot and the network task writes the remote slot. `None` means local play.
     net_local_slot: Option<Player>,
@@ -99,6 +113,8 @@ impl PlaySession {
             _audio_stream: audio_stream,
             texture: None,
             keyboard: [ButtonState::empty(); 2],
+            turbo: [ButtonState::empty(); 2],
+            started: Instant::now(),
             net_local_slot,
             toast: None,
         })
@@ -123,32 +139,44 @@ impl PlaySession {
     /// both P1 and P2 key layouts map to the local slot. Pressing the same logical
     /// button through both layouts and releasing one early is a minor edge case.
     pub fn on_key(&mut self, input_map: &InputMap, code: KeyCode, pressed: bool) -> bool {
-        let Some((player, button)) = input_map.lookup(code) else {
+        let Some((player, key)) = input_map.lookup(code) else {
             return false;
         };
-        let slot = self.net_local_slot.unwrap_or(player);
-        self.keyboard[Self::index(slot)].set(button, pressed);
+        let slot = Self::index(self.net_local_slot.unwrap_or(player));
+        if key.is_turbo() {
+            self.turbo[slot].set(key.button(), pressed);
+        } else {
+            self.keyboard[slot].set(key.button(), pressed);
+        }
         true
     }
 
-    /// Merges keyboard and gamepad bitmaps and publishes them once per frame.
+    /// Merges keyboard and gamepad bitmaps and publishes them once per frame,
+    /// overlaying turbo-held buttons during the on phase of the turbo cadence.
     /// Local play controls both slots; netplay writes only the local slot.
     /// `blocked` publishes released buttons instead, used while the in-game
     /// menu is open; a remote player's slot is never touched.
     pub fn sync_input(&self, gamepad: &GamepadInput, blocked: bool) {
+        let fire = turbo_fire_on(self.started);
         match self.net_local_slot {
             None => {
                 for player in [Player::One, Player::Two] {
-                    let merged =
-                        self.keyboard[Self::index(player)].bits() | gamepad.state(player).bits();
+                    let i = Self::index(player);
+                    let mut merged = self.keyboard[i].bits() | gamepad.state(player).bits();
+                    if fire {
+                        merged |= self.turbo[i].bits() | gamepad.turbo(player).bits();
+                    }
                     let value = if blocked { 0 } else { merged };
                     self.buttons_cell(player).store(value, Ordering::Relaxed);
                 }
             }
             Some(local) => {
                 // In netplay, the first local gamepad controls the local slot.
-                let merged =
-                    self.keyboard[Self::index(local)].bits() | gamepad.state(Player::One).bits();
+                let i = Self::index(local);
+                let mut merged = self.keyboard[i].bits() | gamepad.state(Player::One).bits();
+                if fire {
+                    merged |= self.turbo[i].bits() | gamepad.turbo(Player::One).bits();
+                }
                 let value = if blocked { 0 } else { merged };
                 self.buttons_cell(local).store(value, Ordering::Relaxed);
             }
@@ -159,6 +187,7 @@ impl PlaySession {
     /// opens so keys held at that moment do not stay latched.
     pub fn clear_input(&mut self) {
         self.keyboard = [ButtonState::empty(); 2];
+        self.turbo = [ButtonState::empty(); 2];
     }
 
     /// Pauses or resumes the emulation thread. Only local play pauses; a
@@ -266,6 +295,10 @@ pub struct GuestPlay {
     texture: Option<egui::TextureHandle>,
     /// Local keyboard bitmap; both configured layouts map to the local character.
     keyboard: ButtonState,
+    /// Keyboard turbo-held bitmap, fired on the turbo cadence.
+    turbo: ButtonState,
+    /// Session clock driving the turbo cadence.
+    started: Instant,
     /// Last merged bitmap sent, used to avoid sending unchanged input every frame.
     last_sent: u8,
     /// Spectators watch the stream and never produce input.
@@ -296,6 +329,8 @@ impl GuestPlay {
             _audio_stream: audio_stream,
             texture: None,
             keyboard: ButtonState::empty(),
+            turbo: ButtonState::empty(),
+            started: Instant::now(),
             last_sent: 0,
             spectator,
         })
@@ -312,10 +347,14 @@ impl GuestPlay {
         if self.spectator {
             return false;
         }
-        let Some((_player, button)) = input_map.lookup(code) else {
+        let Some((_player, key)) = input_map.lookup(code) else {
             return false;
         };
-        self.keyboard.set(button, pressed);
+        if key.is_turbo() {
+            self.turbo.set(key.button(), pressed);
+        } else {
+            self.keyboard.set(key.button(), pressed);
+        }
         true
     }
 
@@ -323,9 +362,11 @@ impl GuestPlay {
     /// opens so keys held at that moment do not stay latched.
     pub fn clear_input(&mut self) {
         self.keyboard = ButtonState::empty();
+        self.turbo = ButtonState::empty();
     }
 
-    /// Merges keyboard and gamepad input, returning changes for the network task.
+    /// Merges keyboard and gamepad input, overlaying turbo-held buttons on the
+    /// turbo cadence, and returns changes for the network task.
     /// Spectators never produce outgoing input. `blocked` reports released
     /// buttons instead, used while the in-game menu is open.
     pub fn poll_outgoing(&mut self, gamepad: &GamepadInput, blocked: bool) -> Option<u8> {
@@ -335,7 +376,11 @@ impl GuestPlay {
         let merged = if blocked {
             0
         } else {
-            self.keyboard.bits() | gamepad.state(Player::One).bits()
+            let mut bits = self.keyboard.bits() | gamepad.state(Player::One).bits();
+            if turbo_fire_on(self.started) {
+                bits |= self.turbo.bits() | gamepad.turbo(Player::One).bits();
+            }
+            bits
         };
         if merged != self.last_sent {
             self.last_sent = merged;

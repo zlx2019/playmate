@@ -623,8 +623,7 @@ impl PlaymateApp {
     /// Captures a physical key for the pending setting and saves it immediately.
     /// Returns whether the keyboard event was consumed.
     fn handle_rebind_capture(&mut self, code: KeyCode) -> bool {
-        let Some((player, button)) = self.settings_state_mut().and_then(|s| s.capturing.take())
-        else {
+        let Some((player, key)) = self.settings_state_mut().and_then(|s| s.capturing.take()) else {
             return false;
         };
         if code == KeyCode::Escape {
@@ -633,7 +632,7 @@ impl PlaymateApp {
             }
             return true;
         }
-        config::bind_key(&mut self.cfg, player, button, code);
+        config::bind_key(&mut self.cfg, player, key, code);
         self.input_map = InputMap::from_config(&self.cfg);
         let hint = match config::save(&mut self.cfg) {
             Ok(()) => format!("已保存：{}", settings::key_label(Some(code))),

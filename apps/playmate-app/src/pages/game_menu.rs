@@ -53,7 +53,8 @@ pub fn show(
 
     let title = if paused { "已暂停" } else { "菜单" };
     let size = if menu.settings.is_some() {
-        [620.0, 520.0]
+        // Tall enough for the ten-row binding grid including turbo keys.
+        [620.0, 560.0]
     } else {
         [240.0, 0.0]
     };

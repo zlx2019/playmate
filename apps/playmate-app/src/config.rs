@@ -38,7 +38,50 @@ pub struct KeysConfig {
     pub p2: Option<PlayerKeys>,
 }
 
-/// Bindings for the eight NES/Famicom buttons; `None` means unbound.
+/// A bindable logical control: one of the eight console buttons or an
+/// app-level turbo trigger that auto-fires A/B while held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindKey {
+    /// Direct console button.
+    Btn(Button),
+    /// Turbo trigger for the A button.
+    TurboA,
+    /// Turbo trigger for the B button.
+    TurboB,
+}
+
+impl BindKey {
+    /// All bindable controls, used for iteration and conflict removal.
+    pub const ALL: [BindKey; 10] = [
+        BindKey::Btn(Button::Up),
+        BindKey::Btn(Button::Down),
+        BindKey::Btn(Button::Left),
+        BindKey::Btn(Button::Right),
+        BindKey::Btn(Button::A),
+        BindKey::Btn(Button::B),
+        BindKey::Btn(Button::Select),
+        BindKey::Btn(Button::Start),
+        BindKey::TurboA,
+        BindKey::TurboB,
+    ];
+
+    /// The console button this control ultimately drives.
+    pub const fn button(self) -> Button {
+        match self {
+            BindKey::Btn(button) => button,
+            BindKey::TurboA => Button::A,
+            BindKey::TurboB => Button::B,
+        }
+    }
+
+    /// Whether this control is a turbo trigger rather than a direct button.
+    pub const fn is_turbo(self) -> bool {
+        matches!(self, BindKey::TurboA | BindKey::TurboB)
+    }
+}
+
+/// Bindings for the eight NES/Famicom buttons plus turbo triggers; `None`
+/// means unbound.
 ///
 /// Key names use winit `KeyCode` variant names such as `"KeyW"`, `"ArrowUp"`,
 /// `"Numpad0"`, `"NumpadDecimal"`, `"NumpadEnter"`, and `"ShiftLeft"`.
@@ -61,10 +104,15 @@ pub struct PlayerKeys {
     pub select: Option<KeyCode>,
     /// Start button.
     pub start: Option<KeyCode>,
+    /// Turbo A trigger: auto-fires A while held.
+    pub turbo_a: Option<KeyCode>,
+    /// Turbo B trigger: auto-fires B while held.
+    pub turbo_b: Option<KeyCode>,
 }
 
 impl PlayerKeys {
-    /// Built-in P1 layout: WASD + J(B)/K(A) + left Shift(Select)/Enter(Start).
+    /// Built-in P1 layout: WASD + J(B)/K(A), turbo on U(B)/I(A) above them,
+    /// and left Shift(Select)/Enter(Start).
     fn default_p1() -> Self {
         Self {
             up: Some(KeyCode::KeyW),
@@ -75,10 +123,13 @@ impl PlayerKeys {
             a: Some(KeyCode::KeyK),
             select: Some(KeyCode::ShiftLeft),
             start: Some(KeyCode::Enter),
+            turbo_b: Some(KeyCode::KeyU),
+            turbo_a: Some(KeyCode::KeyI),
         }
     }
 
-    /// Built-in P2 layout: arrows + numpad 0(B)/decimal(A) + numpad Enter(Start).
+    /// Built-in P2 layout: arrows + numpad 0(B)/decimal(A), turbo on numpad
+    /// 1(B)/2(A) above them, and numpad Enter(Start).
     /// Select is unbound by default, matching the original second controller.
     fn default_p2() -> Self {
         Self {
@@ -90,59 +141,56 @@ impl PlayerKeys {
             a: Some(KeyCode::NumpadDecimal),
             select: None,
             start: Some(KeyCode::NumpadEnter),
+            turbo_b: Some(KeyCode::Numpad1),
+            turbo_a: Some(KeyCode::Numpad2),
         }
     }
 
-    /// Returns the physical key bound to an NES/Famicom button.
-    pub fn get(&self, button: Button) -> Option<KeyCode> {
-        match button {
-            Button::Up => self.up,
-            Button::Down => self.down,
-            Button::Left => self.left,
-            Button::Right => self.right,
-            Button::A => self.a,
-            Button::B => self.b,
-            Button::Select => self.select,
-            Button::Start => self.start,
+    /// Returns the physical key bound to a control.
+    pub fn get(&self, key: BindKey) -> Option<KeyCode> {
+        match key {
+            BindKey::Btn(Button::Up) => self.up,
+            BindKey::Btn(Button::Down) => self.down,
+            BindKey::Btn(Button::Left) => self.left,
+            BindKey::Btn(Button::Right) => self.right,
+            BindKey::Btn(Button::A) => self.a,
+            BindKey::Btn(Button::B) => self.b,
+            BindKey::Btn(Button::Select) => self.select,
+            BindKey::Btn(Button::Start) => self.start,
+            BindKey::TurboA => self.turbo_a,
+            BindKey::TurboB => self.turbo_b,
         }
     }
 
-    /// Sets or clears the physical key bound to an NES/Famicom button.
-    pub fn set(&mut self, button: Button, code: Option<KeyCode>) {
-        let slot = match button {
-            Button::Up => &mut self.up,
-            Button::Down => &mut self.down,
-            Button::Left => &mut self.left,
-            Button::Right => &mut self.right,
-            Button::A => &mut self.a,
-            Button::B => &mut self.b,
-            Button::Select => &mut self.select,
-            Button::Start => &mut self.start,
+    /// Sets or clears the physical key bound to a control.
+    pub fn set(&mut self, key: BindKey, code: Option<KeyCode>) {
+        let slot = match key {
+            BindKey::Btn(Button::Up) => &mut self.up,
+            BindKey::Btn(Button::Down) => &mut self.down,
+            BindKey::Btn(Button::Left) => &mut self.left,
+            BindKey::Btn(Button::Right) => &mut self.right,
+            BindKey::Btn(Button::A) => &mut self.a,
+            BindKey::Btn(Button::B) => &mut self.b,
+            BindKey::Btn(Button::Select) => &mut self.select,
+            BindKey::Btn(Button::Start) => &mut self.start,
+            BindKey::TurboA => &mut self.turbo_a,
+            BindKey::TurboB => &mut self.turbo_b,
         };
         *slot = code;
     }
 
-    /// Iterates over `(physical key, console button)` pairs, skipping unbound entries.
-    fn bindings(&self) -> impl Iterator<Item = (KeyCode, Button)> {
-        [
-            (self.up, Button::Up),
-            (self.down, Button::Down),
-            (self.left, Button::Left),
-            (self.right, Button::Right),
-            (self.a, Button::A),
-            (self.b, Button::B),
-            (self.select, Button::Select),
-            (self.start, Button::Start),
-        ]
-        .into_iter()
-        .filter_map(|(code, button)| code.map(|c| (c, button)))
+    /// Iterates over `(physical key, control)` pairs, skipping unbound entries.
+    fn bindings(&self) -> impl Iterator<Item = (KeyCode, BindKey)> {
+        BindKey::ALL
+            .into_iter()
+            .filter_map(|key| self.get(key).map(|code| (code, key)))
     }
 }
 
-/// Keyboard lookup table: physical key -> player and console button.
+/// Keyboard lookup table: physical key -> player and bound control.
 pub struct InputMap {
     /// Flattened bindings; P2 wins when both players bind the same physical key.
-    map: HashMap<KeyCode, (Player, Button)>,
+    map: HashMap<KeyCode, (Player, BindKey)>,
 }
 
 impl InputMap {
@@ -151,17 +199,17 @@ impl InputMap {
         let mut map = HashMap::new();
         let p1 = cfg.keys.p1.clone().unwrap_or_else(PlayerKeys::default_p1);
         let p2 = cfg.keys.p2.clone().unwrap_or_else(PlayerKeys::default_p2);
-        for (code, button) in p1.bindings() {
-            map.insert(code, (Player::One, button));
+        for (code, key) in p1.bindings() {
+            map.insert(code, (Player::One, key));
         }
-        for (code, button) in p2.bindings() {
-            map.insert(code, (Player::Two, button));
+        for (code, key) in p2.bindings() {
+            map.insert(code, (Player::Two, key));
         }
         Self { map }
     }
 
     /// Looks up the binding for a physical key.
-    pub fn lookup(&self, code: KeyCode) -> Option<(Player, Button)> {
+    pub fn lookup(&self, code: KeyCode) -> Option<(Player, BindKey)> {
         self.map.get(&code).copied()
     }
 }
@@ -186,18 +234,18 @@ impl KeysConfig {
     }
 }
 
-/// Binds `code` to a player's button, removing any previous use by either player.
-pub fn bind_key(cfg: &mut Config, player: Player, button: Button, code: KeyCode) {
+/// Binds `code` to a player's control, removing any previous use by either player.
+pub fn bind_key(cfg: &mut Config, player: Player, key: BindKey, code: KeyCode) {
     // Materialize defaults first, then remove every conflicting binding from both players.
     for p in [Player::One, Player::Two] {
         let keys = cfg.keys.effective_mut(p);
-        for b in Button::ALL {
-            if keys.get(b) == Some(code) {
-                keys.set(b, None);
+        for k in BindKey::ALL {
+            if keys.get(k) == Some(code) {
+                keys.set(k, None);
             }
         }
     }
-    cfg.keys.effective_mut(player).set(button, Some(code));
+    cfg.keys.effective_mut(player).set(key, Some(code));
 }
 
 /// Platform user-data directory for configuration and ROMs:
@@ -305,28 +353,50 @@ mod tests {
 
     use super::*;
 
-    /// Default layout uses WASD for P1 and arrows plus numpad for P2.
+    /// Default layout uses WASD for P1 and arrows plus numpad for P2,
+    /// with turbo triggers above each player's B/A keys.
     #[test]
     fn default_layout_lookup() {
         let map = InputMap::from_config(&Config::default());
-        assert_eq!(map.lookup(KeyCode::KeyW), Some((Player::One, Button::Up)));
-        assert_eq!(map.lookup(KeyCode::KeyJ), Some((Player::One, Button::B)));
+        assert_eq!(
+            map.lookup(KeyCode::KeyW),
+            Some((Player::One, BindKey::Btn(Button::Up)))
+        );
+        assert_eq!(
+            map.lookup(KeyCode::KeyJ),
+            Some((Player::One, BindKey::Btn(Button::B)))
+        );
         assert_eq!(
             map.lookup(KeyCode::ShiftLeft),
-            Some((Player::One, Button::Select))
+            Some((Player::One, BindKey::Btn(Button::Select)))
+        );
+        assert_eq!(
+            map.lookup(KeyCode::KeyU),
+            Some((Player::One, BindKey::TurboB))
+        );
+        assert_eq!(
+            map.lookup(KeyCode::KeyI),
+            Some((Player::One, BindKey::TurboA))
         );
         assert_eq!(
             map.lookup(KeyCode::ArrowUp),
-            Some((Player::Two, Button::Up))
+            Some((Player::Two, BindKey::Btn(Button::Up)))
         );
-        assert_eq!(map.lookup(KeyCode::Numpad0), Some((Player::Two, Button::B)));
+        assert_eq!(
+            map.lookup(KeyCode::Numpad0),
+            Some((Player::Two, BindKey::Btn(Button::B)))
+        );
         assert_eq!(
             map.lookup(KeyCode::NumpadDecimal),
-            Some((Player::Two, Button::A))
+            Some((Player::Two, BindKey::Btn(Button::A)))
         );
         assert_eq!(
             map.lookup(KeyCode::NumpadEnter),
-            Some((Player::Two, Button::Start))
+            Some((Player::Two, BindKey::Btn(Button::Start)))
+        );
+        assert_eq!(
+            map.lookup(KeyCode::Numpad1),
+            Some((Player::Two, BindKey::TurboB))
         );
         // P2 Select is unbound by default, and Escape is reserved.
         assert_eq!(map.lookup(KeyCode::Escape), None);
@@ -345,15 +415,30 @@ mod tests {
         .unwrap();
         let map = InputMap::from_config(&cfg);
         // Keys declared in the section are active.
-        assert_eq!(map.lookup(KeyCode::KeyI), Some((Player::One, Button::Up)));
-        assert_eq!(map.lookup(KeyCode::KeyL), Some((Player::One, Button::A)));
+        assert_eq!(
+            map.lookup(KeyCode::KeyI),
+            Some((Player::One, BindKey::Btn(Button::Up)))
+        );
+        assert_eq!(
+            map.lookup(KeyCode::KeyL),
+            Some((Player::One, BindKey::Btn(Button::A)))
+        );
         // Omitted keys are unbound, so the default W binding no longer applies.
         assert_eq!(map.lookup(KeyCode::KeyW), None);
         // P2 retains defaults because its section is absent.
         assert_eq!(
             map.lookup(KeyCode::ArrowLeft),
-            Some((Player::Two, Button::Left))
+            Some((Player::Two, BindKey::Btn(Button::Left)))
         );
+    }
+
+    /// Turbo triggers resolve to their underlying console button.
+    #[test]
+    fn bind_key_turbo_maps_to_button() {
+        assert_eq!(BindKey::TurboA.button(), Button::A);
+        assert_eq!(BindKey::TurboB.button(), Button::B);
+        assert!(BindKey::TurboA.is_turbo());
+        assert!(!BindKey::Btn(Button::A).is_turbo());
     }
 
     /// Misspelled field names are rejected instead of silently ignored.

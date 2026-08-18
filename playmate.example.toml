@@ -13,10 +13,12 @@
 #
 # 注意：
 # - Escape 是保留键（退出程序），请勿绑定。
-# - 某玩家的段（[keys.p1] / [keys.p2]）一旦写出，该玩家 8 个键
+# - 某玩家的段（[keys.p1] / [keys.p2]）一旦写出，该玩家所有键
 #   完全以段内内容为准，段内省略的键视为"不绑定"。
+# - turbo_a / turbo_b 为连发键：按住时对应按键约每秒自动连点 15 次。
 # - 手柄即插即用无需配置：按先后顺序分配给 P1、P2；
-#   十字键/左摇杆=方向，南键(A)=B、东键(B)=A，Back=Select，Menu=Start。
+#   十字键/左摇杆=方向，南键(A)=B、东键(B)=A，西键(X)=连发B、北键(Y)=连发A，
+#   Back=Select，Menu=Start。
 
 [keys.p1]
 up = "KeyW"
@@ -27,6 +29,8 @@ b = "KeyJ"
 a = "KeyK"
 select = "ShiftLeft"
 start = "Enter"
+turbo_b = "KeyU"
+turbo_a = "KeyI"
 
 [keys.p2]
 up = "ArrowUp"
@@ -36,5 +40,7 @@ right = "ArrowRight"
 b = "Numpad0"
 a = "NumpadDecimal"
 start = "NumpadEnter"
+turbo_b = "Numpad1"
+turbo_a = "Numpad2"
 # P2 默认不绑定 select（真机 2P 手柄没有 Select 键），需要时取消注释：
 # select = "NumpadSubtract"
