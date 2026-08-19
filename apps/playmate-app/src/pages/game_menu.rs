@@ -69,6 +69,9 @@ pub enum GameMenuAction {
     RestoreDefaults,
     /// Switch the NTSC filter; persisted and applied by the application.
     SetNtsc(bool),
+    /// Switch per-button hold-turbo as `(hold A, hold B)`; persisted and
+    /// applied by the application.
+    SetHoldTurbo(bool, bool),
 }
 
 /// Draws the dimmed backdrop and the centered overlay. Call only while open.
@@ -113,6 +116,9 @@ pub fn show(
                     SettingsAction::Back => menu.settings = None,
                     SettingsAction::RestoreDefaults => action = GameMenuAction::RestoreDefaults,
                     SettingsAction::SetNtsc(on) => action = GameMenuAction::SetNtsc(on),
+                    SettingsAction::SetHoldTurbo(a, b) => {
+                        action = GameMenuAction::SetHoldTurbo(a, b);
+                    }
                 }
             } else if menu.cheats.is_some() {
                 action = cheats_view(ui, cfg, menu, rom_title);

@@ -423,6 +423,15 @@ impl PlaymateApp {
                             }
                             session.set_ntsc_filter(on);
                         }
+                        // Input merging reads the flags from config every frame,
+                        // so persisting them is all that is needed.
+                        GameMenuAction::SetHoldTurbo(a, b) => {
+                            self.cfg.input.hold_turbo_a = a;
+                            self.cfg.input.hold_turbo_b = b;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save input settings: {e:#}");
+                            }
+                        }
                         // Netplay returns to the room for another game; local
                         // play drops the session and returns to the menu.
                         GameMenuAction::Exit => nav = Nav::BackToRoom,
@@ -509,6 +518,14 @@ impl PlaymateApp {
                             self.cfg.video.ntsc_filter = on;
                             if let Err(e) = config::save(&mut self.cfg) {
                                 log::warn!("failed to save video settings: {e:#}");
+                            }
+                        }
+                        // Applies to the guest's own outgoing input as well.
+                        GameMenuAction::SetHoldTurbo(a, b) => {
+                            self.cfg.input.hold_turbo_a = a;
+                            self.cfg.input.hold_turbo_b = b;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save input settings: {e:#}");
                             }
                         }
                         GameMenuAction::Exit => leave = true,
@@ -643,6 +660,13 @@ impl PlaymateApp {
                     self.cfg.video.ntsc_filter = on;
                     if let Err(e) = config::save(&mut self.cfg) {
                         log::warn!("failed to save video settings: {e:#}");
+                    }
+                }
+                SettingsAction::SetHoldTurbo(a, b) => {
+                    self.cfg.input.hold_turbo_a = a;
+                    self.cfg.input.hold_turbo_b = b;
+                    if let Err(e) = config::save(&mut self.cfg) {
+                        log::warn!("failed to save input settings: {e:#}");
                     }
                 }
             },
@@ -1066,12 +1090,15 @@ impl ApplicationHandler for PlaymateApp {
         {
             self.toggle_game_menu();
         }
+        let input_cfg = self.cfg.input.clone();
         match &mut self.page {
             // Local play and hosts publish merged input directly to emulation.
-            Page::Playing { session, menu, .. } => session.sync_input(&self.gamepad, menu.open),
+            Page::Playing { session, menu, .. } => {
+                session.sync_input(&self.gamepad, menu.open, &input_cfg);
+            }
             // Clients send changed merged input to the host through the network task.
             Page::GuestPlaying { play, net, menu } => {
-                if let Some(buttons) = play.poll_outgoing(&self.gamepad, menu.open) {
+                if let Some(buttons) = play.poll_outgoing(&self.gamepad, menu.open, &input_cfg) {
                     net.handle.send(RoomCmd::Input(buttons));
                 }
             }

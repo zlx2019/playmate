@@ -49,6 +49,12 @@ turbo_a = "Numpad2"
 # [video]
 # ntsc_filter = true    # NTSC 柔化滤镜（CRT 观感，默认开）；false = 锐利点阵
 
+# 输入行为（设置页可视化管理）：
+# [input]
+# hold_turbo_a = false  # 长按 A 连发：按住普通 A 键即以连发节奏自动连点（默认关）。
+# hold_turbo_b = false  # 长按 B 连发：同上，作用于 B 键。
+#                       # 需要长按的键请勿开启：如《超级马力欧》B 跑步、《魂斗罗》A 跳跃。
+
 # 作弊码（Game Genie 金手指码，按游戏名分组；游戏内暂停菜单可视化管理）：
 # 码为 6 或 8 位字母，与 ROM 版本（美版/日版）相关。
 # [[cheats."Super Mario Bros"]]

@@ -30,6 +30,10 @@ pub enum SettingsAction {
     /// Switch the NTSC composite filter on or off; the application persists
     /// the choice and applies it to a running session.
     SetNtsc(bool),
+    /// Switch hold-turbo per button: a plainly held A and/or B auto-fires on
+    /// the turbo cadence. Carries the new `(hold A, hold B)` pair; persisted
+    /// by the application and applied immediately.
+    SetHoldTurbo(bool, bool),
 }
 
 /// Localized labels for bindable controls.
@@ -96,7 +100,7 @@ pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> Setti
         });
 
         ui.add_space(12.0);
-        // Video options; changes apply immediately, including mid-game.
+        // Video and input options; changes apply immediately, including mid-game.
         ui.horizontal(|ui| {
             let mut ntsc = cfg.video.ntsc_filter;
             if ui
@@ -105,6 +109,21 @@ pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> Setti
             {
                 action = SettingsAction::SetNtsc(ntsc);
             }
+        });
+        ui.horizontal(|ui| {
+            let mut hold_a = cfg.input.hold_turbo_a;
+            let mut hold_b = cfg.input.hold_turbo_b;
+            ui.label("长按连发：");
+            let changed = ui.checkbox(&mut hold_a, "A 键").changed()
+                | ui.checkbox(&mut hold_b, "B 键").changed();
+            if changed {
+                action = SettingsAction::SetHoldTurbo(hold_a, hold_b);
+            }
+            ui.label(
+                egui::RichText::new("（需要长按的键请勿开启，如马力欧 B 跑步、魂斗罗 A 跳跃）")
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+            );
         });
 
         ui.add_space(12.0);
