@@ -15,6 +15,7 @@
 mod app;
 mod audio;
 mod config;
+mod covers;
 mod emu;
 mod gamepad;
 mod netplay;

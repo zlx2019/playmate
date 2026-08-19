@@ -375,6 +375,18 @@ pub fn saves_dir() -> PathBuf {
     }
 }
 
+/// Directory for game cover art (user-provided or downloaded), following the
+/// same portable-versus-user-directory rule as [`saves_dir`].
+pub fn covers_dir() -> PathBuf {
+    if PathBuf::from(CONFIG_FILE).exists() {
+        return PathBuf::from("covers");
+    }
+    match data_dir() {
+        Some(dir) => dir.join("covers"),
+        None => PathBuf::from("covers"),
+    }
+}
+
 /// Configuration path: use an existing local `playmate.toml` for portable or
 /// development setups; otherwise use the platform user-data directory.
 fn config_path() -> PathBuf {
