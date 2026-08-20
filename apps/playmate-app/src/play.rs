@@ -10,11 +10,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use playmate_core::{ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, TetanesCore};
+use playmate_core::{
+    Button, ButtonState, NesCore, Player, SCREEN_HEIGHT, SCREEN_WIDTH, TetanesCore,
+};
 use winit::keyboard::KeyCode;
 
 use crate::audio::{self, AudioRing};
-use crate::config::{self, Config, InputMap};
+use crate::config::{self, Config, InputConfig, InputMap};
 use crate::emu::{
     self, CheatCmd, NetSink, STATE_SLOTS, SharedState, StatePaths, THUMB_HEIGHT, THUMB_WIDTH,
 };
@@ -31,6 +33,23 @@ const TURBO_HALF_PERIOD_MS: u128 = 33;
 /// Whether turbo-held buttons fire at this instant of the session clock.
 fn turbo_fire_on(since: Instant) -> bool {
     (since.elapsed().as_millis() / TURBO_HALF_PERIOD_MS).is_multiple_of(2)
+}
+
+/// Bitmap mask applied to plainly held buttons: a hold-turbo-enabled button
+/// has its bit dropped during the off phase so holding it becomes a
+/// turbo-cadence pulse train; every other button passes through.
+const fn hold_turbo_mask(input: &InputConfig, fire: bool) -> u8 {
+    if fire {
+        return !0;
+    }
+    let mut mask = !0u8;
+    if input.hold_turbo_a {
+        mask &= !(1 << Button::A as u8);
+    }
+    if input.hold_turbo_b {
+        mask &= !(1 << Button::B as u8);
+    }
+    mask
 }
 
 /// A running game session.
@@ -208,16 +227,19 @@ impl PlaySession {
 
     /// Merges keyboard and gamepad bitmaps and publishes them once per frame,
     /// overlaying turbo-held buttons during the on phase of the turbo cadence.
+    /// `input` selects which plainly held buttons also pulse on that cadence.
     /// Local play controls both slots; netplay writes only the local slot.
     /// `blocked` publishes released buttons instead, used while the in-game
     /// menu is open; a remote player's slot is never touched.
-    pub fn sync_input(&self, gamepad: &GamepadInput, blocked: bool) {
+    pub fn sync_input(&self, gamepad: &GamepadInput, blocked: bool, input: &InputConfig) {
         let fire = turbo_fire_on(self.started);
+        let mask = hold_turbo_mask(input, fire);
         match self.net_local_slot {
             None => {
                 for player in [Player::One, Player::Two] {
                     let i = Self::index(player);
-                    let mut merged = self.keyboard[i].bits() | gamepad.state(player).bits();
+                    let mut merged =
+                        (self.keyboard[i].bits() | gamepad.state(player).bits()) & mask;
                     if fire {
                         merged |= self.turbo[i].bits() | gamepad.turbo(player).bits();
                     }
@@ -228,7 +250,8 @@ impl PlaySession {
             Some(local) => {
                 // In netplay, the first local gamepad controls the local slot.
                 let i = Self::index(local);
-                let mut merged = self.keyboard[i].bits() | gamepad.state(Player::One).bits();
+                let mut merged =
+                    (self.keyboard[i].bits() | gamepad.state(Player::One).bits()) & mask;
                 if fire {
                     merged |= self.turbo[i].bits() | gamepad.turbo(Player::One).bits();
                 }
@@ -512,17 +535,25 @@ impl GuestPlay {
 
     /// Merges keyboard and gamepad input, overlaying turbo-held buttons on the
     /// turbo cadence, and returns changes for the network task.
+    /// `input` selects which plainly held buttons also pulse on that cadence.
     /// Spectators never produce outgoing input. `blocked` reports released
     /// buttons instead, used while the in-game menu is open.
-    pub fn poll_outgoing(&mut self, gamepad: &GamepadInput, blocked: bool) -> Option<u8> {
+    pub fn poll_outgoing(
+        &mut self,
+        gamepad: &GamepadInput,
+        blocked: bool,
+        input: &InputConfig,
+    ) -> Option<u8> {
         if self.spectator {
             return None;
         }
         let merged = if blocked {
             0
         } else {
-            let mut bits = self.keyboard.bits() | gamepad.state(Player::One).bits();
-            if turbo_fire_on(self.started) {
+            let fire = turbo_fire_on(self.started);
+            let mut bits = (self.keyboard.bits() | gamepad.state(Player::One).bits())
+                & hold_turbo_mask(input, fire);
+            if fire {
                 bits |= self.turbo.bits() | gamepad.turbo(Player::One).bits();
             }
             bits
@@ -554,5 +585,54 @@ impl Drop for PlaySession {
             log::error!("emulation thread terminated unexpectedly");
         }
         log::info!("game session ended: {}", self.rom_title);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the config with the given per-button hold-turbo switches.
+    fn input(hold_a: bool, hold_b: bool) -> InputConfig {
+        InputConfig {
+            hold_turbo_a: hold_a,
+            hold_turbo_b: hold_b,
+        }
+    }
+
+    /// Hold-turbo masks exactly the enabled buttons during the off phase
+    /// and nothing otherwise.
+    #[test]
+    fn hold_turbo_mask_pulses_only_enabled_buttons() {
+        // Disabled or on-phase: every button passes through.
+        assert_eq!(hold_turbo_mask(&input(false, false), false), !0);
+        assert_eq!(hold_turbo_mask(&input(false, false), true), !0);
+        assert_eq!(hold_turbo_mask(&input(true, true), true), !0);
+
+        // Off phase: only the enabled button is dropped, the rest pass.
+        let mut held = ButtonState::empty();
+        held.set(Button::A, true);
+        held.set(Button::B, true);
+        held.set(Button::Right, true);
+        held.set(Button::Start, true);
+        let mut without_a = held;
+        without_a.set(Button::A, false);
+        let mut without_b = held;
+        without_b.set(Button::B, false);
+        let mut without_ab = without_a;
+        without_ab.set(Button::B, false);
+
+        assert_eq!(
+            held.bits() & hold_turbo_mask(&input(true, false), false),
+            without_a.bits()
+        );
+        assert_eq!(
+            held.bits() & hold_turbo_mask(&input(false, true), false),
+            without_b.bits()
+        );
+        assert_eq!(
+            held.bits() & hold_turbo_mask(&input(true, true), false),
+            without_ab.bits()
+        );
     }
 }

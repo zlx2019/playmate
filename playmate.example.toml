@@ -49,8 +49,21 @@ turbo_a = "Numpad2"
 # [video]
 # ntsc_filter = true    # NTSC 柔化滤镜（CRT 观感，默认开）；false = 锐利点阵
 
+# 输入行为（设置页可视化管理）：
+# [input]
+# hold_turbo_a = false  # 长按 A 连发：按住普通 A 键即以连发节奏自动连点（默认关）。
+# hold_turbo_b = false  # 长按 B 连发：同上，作用于 B 键。
+#                       # 需要长按的键请勿开启：如《超级马力欧》B 跑步、《魂斗罗》A 跳跃。
+
 # 作弊码（Game Genie 金手指码，按游戏名分组；游戏内暂停菜单可视化管理）：
 # 码为 6 或 8 位字母，与 ROM 版本（美版/日版）相关。
 # [[cheats."Super Mario Bros"]]
 # code = "SXIOPO"     # 无限命
 # enabled = true
+
+# 游戏封面：
+# 选择游戏页自动从 libretro-thumbnails 封面库按文件名匹配下载，
+# 成功后缓存到 covers 目录（便携模式在程序旁，否则在用户数据目录）。
+# 常见游戏的中文名（魂斗罗、超级玛丽、双截龙……）已内置别名自动匹配；
+# 仍匹配不到的游戏，可手动放置 covers/<ROM 文件名>.png 作为封面，
+# 然后在选择游戏页点击"刷新"即可生效。

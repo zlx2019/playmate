@@ -69,6 +69,9 @@ pub enum GameMenuAction {
     RestoreDefaults,
     /// Switch the NTSC filter; persisted and applied by the application.
     SetNtsc(bool),
+    /// Switch per-button hold-turbo as `(hold A, hold B)`; persisted and
+    /// applied by the application.
+    SetHoldTurbo(bool, bool),
 }
 
 /// Draws the dimmed backdrop and the centered overlay. Call only while open.
@@ -93,9 +96,9 @@ pub fn show(
     );
 
     let title = if paused { "已暂停" } else { "菜单" };
+    // Heights are 0 so the window always adapts to its content.
     let size = if menu.settings.is_some() {
-        // Tall enough for the ten-row binding grid including turbo keys.
-        [620.0, 560.0]
+        [620.0, 0.0]
     } else if menu.cheats.is_some() || menu.slots.is_some() {
         [430.0, 0.0]
     } else {
@@ -108,11 +111,16 @@ pub fn show(
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ui.ctx(), |ui| {
             if let Some(state) = &mut menu.settings {
-                match settings::show(ui, cfg, state) {
+                // The embedded body has no page panel, so the window height
+                // tracks the content instead of clipping it.
+                match settings::show_embedded(ui, cfg, state) {
                     SettingsAction::None => {}
                     SettingsAction::Back => menu.settings = None,
                     SettingsAction::RestoreDefaults => action = GameMenuAction::RestoreDefaults,
                     SettingsAction::SetNtsc(on) => action = GameMenuAction::SetNtsc(on),
+                    SettingsAction::SetHoldTurbo(a, b) => {
+                        action = GameMenuAction::SetHoldTurbo(a, b);
+                    }
                 }
             } else if menu.cheats.is_some() {
                 action = cheats_view(ui, cfg, menu, rom_title);

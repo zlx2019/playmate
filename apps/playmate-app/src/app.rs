@@ -47,6 +47,8 @@ pub enum Page {
         games: Vec<GameEntry>,
         /// Error from the most recent launch attempt.
         error: Option<String>,
+        /// Live search text filtering the cover grid.
+        filter: String,
     },
     /// Active local or host game.
     Playing {
@@ -138,6 +140,8 @@ pub struct PlaymateApp {
     input_map: InputMap,
     /// Gamepad input manager.
     gamepad: GamepadInput,
+    /// Cover-art cache for the game library, kept across page switches.
+    covers: crate::covers::CoverStore,
     /// Current page.
     page: Page,
     /// Most recently joined address, PIN, and role for quick rejoin.
@@ -167,6 +171,7 @@ impl PlaymateApp {
             cfg,
             input_map,
             gamepad: GamepadInput::new(),
+            covers: crate::covers::CoverStore::new(),
             page: Page::MainMenu,
             last_join: None,
             egui_ctx,
@@ -206,6 +211,7 @@ impl PlaymateApp {
                                     nav = Nav::To(Box::new(Page::GameSelect {
                                         games: game_select::scan_roms(),
                                         error: Some(format!("继续游戏失败: {e:#}")),
+                                        filter: String::new(),
                                     }));
                                 }
                             }
@@ -215,6 +221,7 @@ impl PlaymateApp {
                         nav = Nav::To(Box::new(Page::GameSelect {
                             games: game_select::scan_roms(),
                             error: None,
+                            filter: String::new(),
                         }));
                     }
                     MenuAction::LanPlay => {
@@ -229,11 +236,20 @@ impl PlaymateApp {
                     }
                 }
             }
-            Page::GameSelect { games, error } => {
-                match game_select::show(ui, games, error.as_deref()) {
+            Page::GameSelect {
+                games,
+                error,
+                filter,
+            } => {
+                match game_select::show(ui, games, error.as_deref(), filter, &mut self.covers) {
                     GameSelectAction::None => {}
                     GameSelectAction::Back => nav = Nav::To(Box::new(Page::MainMenu)),
-                    GameSelectAction::Refresh => *games = game_select::scan_roms(),
+                    GameSelectAction::Refresh => {
+                        *games = game_select::scan_roms();
+                        // Also retry covers that missed, e.g. after the user
+                        // dropped images into covers/ or the network came back.
+                        self.covers.retry_misses();
+                    }
                     GameSelectAction::Play(path) => {
                         match PlaySession::start(&path, &self.cfg) {
                             Ok(session) => {
@@ -423,6 +439,15 @@ impl PlaymateApp {
                             }
                             session.set_ntsc_filter(on);
                         }
+                        // Input merging reads the flags from config every frame,
+                        // so persisting them is all that is needed.
+                        GameMenuAction::SetHoldTurbo(a, b) => {
+                            self.cfg.input.hold_turbo_a = a;
+                            self.cfg.input.hold_turbo_b = b;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save input settings: {e:#}");
+                            }
+                        }
                         // Netplay returns to the room for another game; local
                         // play drops the session and returns to the menu.
                         GameMenuAction::Exit => nav = Nav::BackToRoom,
@@ -509,6 +534,14 @@ impl PlaymateApp {
                             self.cfg.video.ntsc_filter = on;
                             if let Err(e) = config::save(&mut self.cfg) {
                                 log::warn!("failed to save video settings: {e:#}");
+                            }
+                        }
+                        // Applies to the guest's own outgoing input as well.
+                        GameMenuAction::SetHoldTurbo(a, b) => {
+                            self.cfg.input.hold_turbo_a = a;
+                            self.cfg.input.hold_turbo_b = b;
+                            if let Err(e) = config::save(&mut self.cfg) {
+                                log::warn!("failed to save input settings: {e:#}");
                             }
                         }
                         GameMenuAction::Exit => leave = true,
@@ -643,6 +676,13 @@ impl PlaymateApp {
                     self.cfg.video.ntsc_filter = on;
                     if let Err(e) = config::save(&mut self.cfg) {
                         log::warn!("failed to save video settings: {e:#}");
+                    }
+                }
+                SettingsAction::SetHoldTurbo(a, b) => {
+                    self.cfg.input.hold_turbo_a = a;
+                    self.cfg.input.hold_turbo_b = b;
+                    if let Err(e) = config::save(&mut self.cfg) {
+                        log::warn!("failed to save input settings: {e:#}");
                     }
                 }
             },
@@ -1066,12 +1106,15 @@ impl ApplicationHandler for PlaymateApp {
         {
             self.toggle_game_menu();
         }
+        let input_cfg = self.cfg.input.clone();
         match &mut self.page {
             // Local play and hosts publish merged input directly to emulation.
-            Page::Playing { session, menu, .. } => session.sync_input(&self.gamepad, menu.open),
+            Page::Playing { session, menu, .. } => {
+                session.sync_input(&self.gamepad, menu.open, &input_cfg);
+            }
             // Clients send changed merged input to the host through the network task.
             Page::GuestPlaying { play, net, menu } => {
-                if let Some(buttons) = play.poll_outgoing(&self.gamepad, menu.open) {
+                if let Some(buttons) = play.poll_outgoing(&self.gamepad, menu.open, &input_cfg) {
                     net.handle.send(RoomCmd::Input(buttons));
                 }
             }

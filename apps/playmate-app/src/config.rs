@@ -31,6 +31,26 @@ pub struct Config {
     /// Video output options.
     #[serde(default)]
     pub video: VideoConfig,
+    /// Input behavior options.
+    #[serde(default)]
+    pub input: InputConfig,
+}
+
+/// Input behavior options.
+///
+/// Hold-turbo auto-fires a plainly held button on the turbo cadence, like
+/// aftermarket turbo controllers. Both switches default to off because many
+/// games need a continuously held button: Super Mario Bros. runs with B
+/// held, Contra jumps with A held.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputConfig {
+    /// Auto-fire a plainly held A button.
+    #[serde(default)]
+    pub hold_turbo_a: bool,
+    /// Auto-fire a plainly held B button.
+    #[serde(default)]
+    pub hold_turbo_b: bool,
 }
 
 /// Video output options.
@@ -352,6 +372,18 @@ pub fn saves_dir() -> PathBuf {
     match data_dir() {
         Some(dir) => dir.join("saves"),
         None => PathBuf::from("saves"),
+    }
+}
+
+/// Directory for game cover art (user-provided or downloaded), following the
+/// same portable-versus-user-directory rule as [`saves_dir`].
+pub fn covers_dir() -> PathBuf {
+    if PathBuf::from(CONFIG_FILE).exists() {
+        return PathBuf::from("covers");
+    }
+    match data_dir() {
+        Some(dir) => dir.join("covers"),
+        None => PathBuf::from("covers"),
     }
 }
 
