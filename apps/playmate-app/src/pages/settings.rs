@@ -86,66 +86,79 @@ pub fn key_label(code: Option<KeyCode>) -> String {
     text.to_string()
 }
 
-/// Draws the settings page.
+/// Draws the standalone settings page inside its own panel.
 pub fn show(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> SettingsAction {
     let mut action = SettingsAction::None;
     egui::CentralPanel::default().show(ui, |ui| {
-        if theme::page_header(ui, "设置") {
-            action = SettingsAction::Back;
+        action = body(ui, cfg, state);
+    });
+    action
+}
+
+/// Draws the settings content without a page container, for embedding in
+/// the in-game menu window, whose height adapts to this content.
+pub fn show_embedded(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> SettingsAction {
+    body(ui, cfg, state)
+}
+
+/// Shared settings body: key bindings, video and input options, and hints.
+fn body(ui: &mut egui::Ui, cfg: &Config, state: &mut SettingsState) -> SettingsAction {
+    let mut action = SettingsAction::None;
+    if theme::page_header(ui, "设置") {
+        action = SettingsAction::Back;
+    }
+
+    ui.columns(2, |cols| {
+        player_keys_panel(&mut cols[0], cfg, state, Player::One, "P1 键位");
+        player_keys_panel(&mut cols[1], cfg, state, Player::Two, "P2 键位");
+    });
+
+    ui.add_space(12.0);
+    // Video and input options; changes apply immediately, including mid-game.
+    ui.horizontal(|ui| {
+        let mut ntsc = cfg.video.ntsc_filter;
+        if ui
+            .checkbox(&mut ntsc, "NTSC 柔化滤镜（CRT 显像管观感，关闭为锐利点阵）")
+            .changed()
+        {
+            action = SettingsAction::SetNtsc(ntsc);
         }
-
-        ui.columns(2, |cols| {
-            player_keys_panel(&mut cols[0], cfg, state, Player::One, "P1 键位");
-            player_keys_panel(&mut cols[1], cfg, state, Player::Two, "P2 键位");
-        });
-
-        ui.add_space(12.0);
-        // Video and input options; changes apply immediately, including mid-game.
-        ui.horizontal(|ui| {
-            let mut ntsc = cfg.video.ntsc_filter;
-            if ui
-                .checkbox(&mut ntsc, "NTSC 柔化滤镜（CRT 显像管观感，关闭为锐利点阵）")
-                .changed()
-            {
-                action = SettingsAction::SetNtsc(ntsc);
-            }
-        });
-        ui.horizontal(|ui| {
-            let mut hold_a = cfg.input.hold_turbo_a;
-            let mut hold_b = cfg.input.hold_turbo_b;
-            ui.label("长按连发：");
-            let changed = ui.checkbox(&mut hold_a, "A 键").changed()
-                | ui.checkbox(&mut hold_b, "B 键").changed();
-            if changed {
-                action = SettingsAction::SetHoldTurbo(hold_a, hold_b);
-            }
-            ui.label(
-                egui::RichText::new("（需要长按的键请勿开启，如马力欧 B 跑步、魂斗罗 A 跳跃）")
-                    .size(12.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        });
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui.button("↺ 恢复默认键位").clicked() {
-                action = SettingsAction::RestoreDefaults;
-            }
-            if let Some(hint) = &state.hint {
-                ui.label(egui::RichText::new(hint).color(theme::GREEN));
-            }
-        });
-        ui.add_space(6.0);
+    });
+    ui.horizontal(|ui| {
+        let mut hold_a = cfg.input.hold_turbo_a;
+        let mut hold_b = cfg.input.hold_turbo_b;
+        ui.label("长按连发：");
+        let changed =
+            ui.checkbox(&mut hold_a, "A 键").changed() | ui.checkbox(&mut hold_b, "B 键").changed();
+        if changed {
+            action = SettingsAction::SetHoldTurbo(hold_a, hold_b);
+        }
         ui.label(
-            egui::RichText::new(
-                "提示：改动即时保存；同一物理键被重复绑定时会自动解除旧绑定；\
-                 Esc 为保留键不可绑定。连发键按住时约每秒 15 连；\
-                 手柄无需配置，即插即用（X/Y 键为连发 B/A，Mode 键呼出菜单）。",
-            )
-            .size(12.0)
-            .color(theme::TEXT_WEAK),
+            egui::RichText::new("（需要长按的键请勿开启，如马力欧 B 跑步、魂斗罗 A 跳跃）")
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
         );
     });
+
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        if ui.button("↺ 恢复默认键位").clicked() {
+            action = SettingsAction::RestoreDefaults;
+        }
+        if let Some(hint) = &state.hint {
+            ui.label(egui::RichText::new(hint).color(theme::GREEN));
+        }
+    });
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "提示：改动即时保存；同一物理键被重复绑定时会自动解除旧绑定；\
+                 Esc 为保留键不可绑定。连发键按住时约每秒 15 连；\
+                 手柄无需配置，即插即用（X/Y 键为连发 B/A，Mode 键呼出菜单）。",
+        )
+        .size(12.0)
+        .color(theme::TEXT_WEAK),
+    );
     action
 }
 
