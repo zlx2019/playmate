@@ -3106,9 +3106,9 @@ dependencies = [
 
 [[package]]
 name = "tetanes-core"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d683b92a2702016b99d8b4fe8069dd15a302c5a7b6b6f73c1d55c2301550c02a"
+checksum = "c12a52c1ee5d08354b57b57e858367518e9a7a266ad19ca65138ceb054d831c4"
 dependencies = [
  "base64",
  "bincode",

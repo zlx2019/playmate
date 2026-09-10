@@ -15,7 +15,7 @@ license = "MIT"
 playmate-core = { path = "deps/playmate-core" }
 playmate-net = { path = "deps/playmate-net" }
 
-tetanes-core = "0.15"
+tetanes-core = "0.17"
 
 egui = "0.36"
 egui-winit = "0.36"
