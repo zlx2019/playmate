@@ -5,7 +5,7 @@
 //! instead of silently ignoring invalid user changes.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use playmate_core::{Button, Player};
@@ -16,8 +16,11 @@ use winit::keyboard::KeyCode;
 const CONFIG_FILE: &str = "playmate.toml";
 
 /// Top-level configuration.
+///
+/// Unknown sections are ignored on purpose: a file written by a newer
+/// version must stay readable by an older one, since both share the same
+/// path. Leaf structs with a stable field set still reject typos.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Key binding configuration.
     #[serde(default)]
@@ -43,7 +46,6 @@ pub struct Config {
 /// games need a continuously held button: Super Mario Bros. runs with B
 /// held, Contra jumps with A held.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InputConfig {
     /// Auto-fire a plainly held A button.
     #[serde(default)]
@@ -55,7 +57,6 @@ pub struct InputConfig {
 
 /// Video output options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VideoConfig {
     /// NTSC composite filter, the hardware-faithful softened look shown by a
     /// CRT. Disabled means raw crisp pixels.
@@ -105,7 +106,6 @@ impl Config {
 /// defaults, while a present section completely replaces them. Omitted keys
 /// inside a present section are unbound.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct KeysConfig {
     /// P1 bindings; defaults to WASD, J/K, left Shift, and Enter.
     pub p1: Option<PlayerKeys>,
@@ -420,18 +420,59 @@ pub fn save(cfg: &mut Config) -> Result<()> {
     Ok(())
 }
 
-/// Loads `playmate.toml` from the selected path or uses built-in defaults when absent.
-pub fn load() -> Result<Config> {
+/// Loads `playmate.toml`, degrading to built-in defaults instead of failing:
+/// a broken configuration must never prevent the application from opening,
+/// because the user interface is the only way to repair it.
+///
+/// A missing file is normal. An unreadable or malformed one is moved aside
+/// as `playmate.toml.bak` so its contents are preserved rather than
+/// overwritten by the next save. Returns the configuration along with a
+/// short message for the user interface whenever defaults were substituted.
+pub fn load() -> (Config, Option<String>) {
     let path = config_path();
     if !path.exists() {
         log::info!("{CONFIG_FILE} not found; using default bindings (see playmate.example.toml)");
-        return Ok(Config::default());
+        return (Config::default(), None);
     }
-    let text = std::fs::read_to_string(&path).with_context(|| format!("读取 {path:?} 失败"))?;
-    let cfg: Config =
-        toml::from_str(&text).with_context(|| format!("解析 {path:?} 失败，请检查格式"))?;
-    log::info!("configuration loaded from {path:?}");
-    Ok(cfg)
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("failed to read {path:?}: {e}; falling back to defaults");
+            return (
+                Config::default(),
+                Some("配置文件无法读取，已使用默认设置".to_string()),
+            );
+        }
+    };
+    match toml::from_str::<Config>(&text) {
+        Ok(cfg) => {
+            log::info!("configuration loaded from {path:?}");
+            (cfg, None)
+        }
+        Err(e) => {
+            log::warn!("failed to parse {path:?}: {e}");
+            let note = match back_up(&path) {
+                true => "配置文件无法解析，已备份为 playmate.toml.bak 并恢复默认设置",
+                false => "配置文件无法解析，已恢复默认设置",
+            };
+            (Config::default(), Some(note.to_string()))
+        }
+    }
+}
+
+/// Moves an unusable configuration file aside, reporting whether it worked.
+fn back_up(path: &Path) -> bool {
+    let backup = path.with_extension("toml.bak");
+    match std::fs::rename(path, &backup) {
+        Ok(()) => {
+            log::info!("unusable configuration backed up to {backup:?}");
+            true
+        }
+        Err(e) => {
+            log::warn!("failed to back up {path:?}: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,7 +569,32 @@ mod tests {
         assert!(!BindKey::Btn(Button::A).is_turbo());
     }
 
-    /// Misspelled field names are rejected instead of silently ignored.
+    /// Sections written by a newer version are ignored rather than rejected,
+    /// so an older build still starts from a shared configuration file.
+    #[test]
+    fn unknown_top_level_section_is_ignored() {
+        let cfg: Config = toml::from_str(
+            r#"
+            future_flag = true
+
+            [audio]
+            volume = 0.5
+
+            [keys.p1]
+            up = "KeyI"
+            "#,
+        )
+        .unwrap();
+        // Known sections still apply.
+        let map = InputMap::from_config(&cfg);
+        assert_eq!(
+            map.lookup(KeyCode::KeyI),
+            Some((Player::One, BindKey::Btn(Button::Up)))
+        );
+    }
+
+    /// Misspelled key names inside a player section are rejected instead of
+    /// silently unbinding the control.
     #[test]
     fn unknown_field_is_rejected() {
         let result: std::result::Result<Config, _> = toml::from_str(

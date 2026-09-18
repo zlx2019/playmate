@@ -24,7 +24,13 @@ const MENU_WIDTH: f32 = 360.0;
 
 /// Draws the main menu and returns the current frame's action.
 /// `resume_title` shows a quick-resume row for the last played game.
-pub fn show(ui: &mut egui::Ui, resume_title: Option<&str>) -> MenuAction {
+/// `warning` reports a startup problem such as a configuration reset and is
+/// cleared once the user dismisses it.
+pub fn show(
+    ui: &mut egui::Ui,
+    resume_title: Option<&str>,
+    warning: &mut Option<String>,
+) -> MenuAction {
     let mut action = MenuAction::None;
     egui::CentralPanel::default().show(ui, |ui| {
         let top = (ui.available_height() * 0.14).max(24.0);
@@ -49,6 +55,22 @@ pub fn show(ui: &mut egui::Ui, resume_title: Option<&str>) -> MenuAction {
                     .color(theme::TEXT_WEAK),
             );
             ui.add_space(36.0);
+
+            // Startup warning above the menu rows, dismissible for this run.
+            let mut dismiss = false;
+            if let Some(msg) = warning.as_deref() {
+                ui.scope(|ui| {
+                    ui.set_max_width(MENU_WIDTH);
+                    theme::error_banner(ui, msg);
+                    if ui.small_button("知道了").clicked() {
+                        dismiss = true;
+                    }
+                });
+                ui.add_space(16.0);
+            }
+            if dismiss {
+                *warning = None;
+            }
 
             // Centered menu rows with a fixed maximum width.
             ui.scope(|ui| {

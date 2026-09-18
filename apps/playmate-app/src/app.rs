@@ -142,6 +142,8 @@ pub struct PlaymateApp {
     gamepad: GamepadInput,
     /// Cover-art cache for the game library, kept across page switches.
     covers: crate::covers::CoverStore,
+    /// Startup warning shown on the main menu, such as a configuration reset.
+    startup_warning: Option<String>,
     /// Current page.
     page: Page,
     /// Most recently joined address, PIN, and role for quick rejoin.
@@ -161,7 +163,9 @@ impl PlaymateApp {
     pub fn new() -> anyhow::Result<Self> {
         let rt = tokio::runtime::Runtime::new()?;
         config::ensure_data_dirs();
-        let cfg = config::load()?;
+        // A broken configuration degrades to defaults instead of aborting,
+        // so the settings page stays reachable to repair it.
+        let (cfg, startup_warning) = config::load();
         let input_map = InputMap::from_config(&cfg);
         let egui_ctx = egui::Context::default();
         install_cjk_fonts(&egui_ctx);
@@ -172,6 +176,7 @@ impl PlaymateApp {
             input_map,
             gamepad: GamepadInput::new(),
             covers: crate::covers::CoverStore::new(),
+            startup_warning,
             page: Page::MainMenu,
             last_join: None,
             egui_ctx,
@@ -194,7 +199,7 @@ impl PlaymateApp {
                     .filter(|p| p.is_file())
                     .and_then(|p| p.file_stem())
                     .map(|n| n.to_string_lossy().into_owned());
-                match main_menu::show(ui, resume_title.as_deref()) {
+                match main_menu::show(ui, resume_title.as_deref(), &mut self.startup_warning) {
                     MenuAction::None => {}
                     MenuAction::Continue => {
                         if let Some(path) = self.cfg.last_game.clone() {
